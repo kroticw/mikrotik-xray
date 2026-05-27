@@ -1,0 +1,9 @@
+.git
+.gitignore
+.idea
+.vscode
+dist
+routeros
+build.sh
+*.tar
+*.md

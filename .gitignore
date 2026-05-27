@@ -1,0 +1,9 @@
+dist/
+*.tar
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# never commit real subscription URLs / tokens
+routeros/*.local.rsc

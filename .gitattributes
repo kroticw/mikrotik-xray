@@ -1,0 +1,9 @@
+# exported container image — binary, excluded from language stats
+dist/**            binary linguist-generated
+*.tar              binary linguist-generated
+
+# RouterOS scripts — show as plain text on GitHub
+*.rsc              text linguist-language=Tcl
+
+# Bash scripts
+*.sh               text eol=lf
