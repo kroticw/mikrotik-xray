@@ -77,7 +77,7 @@
 /container/envs/add list="xray-env" key="BYPASS_GEOIP"            value=$bypassGeoip
 # REDIRECT_ENABLED=1 makes entrypoint install iptables nat REDIRECT in the
 # container's own namespace, so xray can read SO_ORIGINAL_DST. Pair with
-# routeros/02c-routing-rules-mark.rsc (mark-routing -> gw=container).
+# routeros/02c-routing-rules.rsc (mark-routing -> gw=container).
 /container/envs/add list="xray-env" key="REDIRECT_ENABLED"        value="1"
 
 # ---------- persistent volumes (optional) -------------------------------------
