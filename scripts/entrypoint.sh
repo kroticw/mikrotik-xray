@@ -389,6 +389,29 @@ build_config() {
         --arg     probe_interval   "${OBSERVATORY_INTERVAL}" \
         '{
             log: { loglevel: $log_level },
+            policy: {
+                # Bound per-connection memory and reap stuck/idle connections.
+                # Under full-tunnel xray holds a buffer + goroutines per LAN
+                # connection; without these caps memory grows unbounded as
+                # half-open/idle connections accumulate (see XTLS/Xray-core
+                # #4054, #4294). bufferSize caps per-direction RAM; connIdle
+                # closes silent connections so they stop pinning memory.
+                levels: {
+                    "0": {
+                        handshake: 4,
+                        connIdle: 180,
+                        uplinkOnly: 2,
+                        downlinkOnly: 4,
+                        bufferSize: 64
+                    }
+                },
+                system: {
+                    statsInboundUplink: false,
+                    statsInboundDownlink: false,
+                    statsOutboundUplink: false,
+                    statsOutboundDownlink: false
+                }
+            },
             dns: {
                 servers: [
                     { address: "1.1.1.1", domains: ["geosite:geolocation-!cn"] },
