@@ -45,10 +45,21 @@ IFS=$'\n\t'
 : "${TPROXY_TABLE:=100}"
 : "${REDIRECT_ENABLED:=0}"
 : "${TPROXY_ENABLED:=0}"
+# Geo-database auto-update. The image ships geoip.dat/geosite.dat as a seed;
+# they are copied into a writable dir and periodically refreshed from these
+# URLs. xray reads them via XRAY_LOCATION_ASSET (exported in main). Set the
+# URLs to a reachable mirror if GitHub is blocked. Empty URL disables update
+# of that file (seed/baked-in copy is kept).
+: "${GEODATA_REFRESH_SECONDS:=86400}"     # 24h
+: "${GEODATA_URL_GEOIP:=https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat}"
+: "${GEODATA_URL_GEOSITE:=https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat}"
 
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 CONFIG_NEW="${XRAY_CONFIG_DIR}/config.json.new"
 HASH_FILE="${XRAY_STATE_DIR}/config.sha256"
+GEODATA_DIR="${XRAY_STATE_DIR}/geodata"
+GEODATA_SEED_DIR="/usr/local/share/xray"
+GEODATA_LAST_RUN=0
 
 XRAY_PID=0
 REFRESH_PID=0
@@ -478,6 +489,66 @@ build_config() {
         }'
 }
 
+# ---------- geo-database management ------------------------------------------
+
+# init_geodata: ensure GEODATA_DIR holds usable geoip.dat/geosite.dat, seeding
+# from the image's baked-in copy when absent, and point xray at the writable
+# dir. Must run before the first config validation so geoip:/geosite: matchers
+# resolve.
+init_geodata() {
+    mkdir --parents "${GEODATA_DIR}"
+    local f
+    for f in geoip.dat geosite.dat; do
+        if [ ! -s "${GEODATA_DIR}/${f}" ] && [ -s "${GEODATA_SEED_DIR}/${f}" ]; then
+            cp "${GEODATA_SEED_DIR}/${f}" "${GEODATA_DIR}/${f}"
+            log "geodata: seeded ${f} from image"
+        fi
+    done
+    export XRAY_LOCATION_ASSET="${GEODATA_DIR}"
+}
+
+# fetch_one_geodata <filename> <url>: download atomically into GEODATA_DIR.
+# Returns 10 if the file changed, 0 if unchanged or URL empty, 1 on failure
+# (the existing file is always kept on failure).
+fetch_one_geodata() {
+    local f="$1" url="$2" tmp new_hash old_hash
+    [ -n "${url}" ] || return 0
+    tmp="${GEODATA_DIR}/.${f}.tmp"
+    if ! curl --silent --show-error --fail --location --max-time 120 \
+            --output "${tmp}" "${url}"; then
+        rm --force "${tmp}" 2>/dev/null || true
+        log "geodata: ${f} download failed, keeping existing copy"
+        return 1
+    fi
+    if [ ! -s "${tmp}" ]; then
+        rm --force "${tmp}" 2>/dev/null || true
+        log "geodata: ${f} download empty, skipped"
+        return 1
+    fi
+    new_hash="$(sha256sum "${tmp}" | awk '{print $1}')"
+    old_hash="$(sha256sum "${GEODATA_DIR}/${f}" 2>/dev/null | awk '{print $1}')"
+    if [ "${new_hash}" = "${old_hash}" ]; then
+        rm --force "${tmp}"
+        return 0
+    fi
+    mv --force "${tmp}" "${GEODATA_DIR}/${f}"
+    log "geodata: ${f} updated (${new_hash:0:12})"
+    return 10
+}
+
+# fetch_geodata: refresh both geo files. Returns 10 if any changed (caller
+# should reload xray to pick them up), else 0. Download errors are non-fatal.
+fetch_geodata() {
+    local changed=0 rc
+    rc=0; fetch_one_geodata geoip.dat   "${GEODATA_URL_GEOIP}"   || rc=$?
+    [ "${rc}" -eq 10 ] && changed=1
+    rc=0; fetch_one_geodata geosite.dat "${GEODATA_URL_GEOSITE}" || rc=$?
+    [ "${rc}" -eq 10 ] && changed=1
+    GEODATA_LAST_RUN="$(date +%s)"
+    [ "${changed}" -eq 1 ] && return 10
+    return 0
+}
+
 # ---------- subscription pipeline --------------------------------------------
 
 refresh_config_once() {
@@ -624,13 +695,23 @@ stop_xray() {
 refresh_loop() {
     while sleep "${REFRESH_INTERVAL_SECONDS}" & wait $!; do
         if [ "${SHUTTING_DOWN}" = "1" ]; then return 0; fi
-        local rc=0
+        local need_reload=0 rc=0
         refresh_config_once || rc=$?
         if [ "${rc}" -eq 10 ]; then
-            log "config changed → restarting xray"
-            kill -USR1 "$$" 2>/dev/null || true
+            need_reload=1
         elif [ "${rc}" -ne 0 ]; then
             log "refresh failed (rc=${rc}), will retry next cycle"
+        fi
+        # Geo-databases refresh on their own (slower) cadence.
+        local now
+        now="$(date +%s)"
+        if [ "$(( now - GEODATA_LAST_RUN ))" -ge "${GEODATA_REFRESH_SECONDS}" ]; then
+            rc=0; fetch_geodata || rc=$?
+            [ "${rc}" -eq 10 ] && need_reload=1
+        fi
+        if [ "${need_reload}" -eq 1 ]; then
+            log "config/geodata changed → restarting xray"
+            kill -USR1 "$$" 2>/dev/null || true
         fi
     done
 }
@@ -662,6 +743,10 @@ main() {
     mkdir --parents "${XRAY_CONFIG_DIR}" "${XRAY_STATE_DIR}"
 
     setup_inbound
+
+    init_geodata
+    log "refreshing geo-databases (geoip/geosite)"
+    fetch_geodata || true
 
     log "performing initial subscription fetch"
     local rc=0
