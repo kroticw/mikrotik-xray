@@ -53,6 +53,13 @@ IFS=$'\n\t'
 : "${GEODATA_REFRESH_SECONDS:=86400}"     # 24h
 : "${GEODATA_URL_GEOIP:=https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat}"
 : "${GEODATA_URL_GEOSITE:=https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat}"
+# Memory watchdog. xray slowly leaks memory under full-tunnel (unbounded
+# growth from connections that never fully close — XTLS/Xray-core#4054,#4294);
+# policy timeouts only slow it. To avoid the container OOM-killing, reload
+# xray (a ~1-2s in-container restart that resets RSS) once its memory crosses
+# the soft threshold. 0 disables the watchdog.
+: "${XRAY_MEM_RELOAD_MB:=280}"
+: "${MEM_CHECK_INTERVAL_SECONDS:=30}"
 
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 CONFIG_NEW="${XRAY_CONFIG_DIR}/config.json.new"
@@ -63,6 +70,7 @@ GEODATA_LAST_RUN=0
 
 XRAY_PID=0
 REFRESH_PID=0
+WATCHDOG_PID=0
 SHUTTING_DOWN=0
 
 # ---------- logging -----------------------------------------------------------
@@ -716,6 +724,36 @@ refresh_loop() {
     done
 }
 
+# xray_rss_mb → echoes the resident set size of the running xray in MiB, or
+# nothing if xray is not found. Uses pidof so it tracks the current pid across
+# reloads (the watchdog runs in a subshell and cannot see XRAY_PID updates).
+xray_rss_mb() {
+    local pid rss_kb
+    pid="$(pidof xray 2>/dev/null | awk '{print $1}')"
+    [ -n "${pid}" ] || return 0
+    rss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/${pid}/status" 2>/dev/null)"
+    [ -n "${rss_kb}" ] && printf '%s' "$(( rss_kb / 1024 ))"
+}
+
+# memory_watchdog_loop: periodically reload xray once its RSS crosses the soft
+# threshold, reclaiming memory before the container hits its hard cgroup limit
+# and gets OOM-killed. Signals the parent (USR1) so reload runs in the main
+# context, like refresh_loop.
+memory_watchdog_loop() {
+    [ "${XRAY_MEM_RELOAD_MB}" -gt 0 ] 2>/dev/null || { log "memory-watchdog disabled"; return 0; }
+    log "memory-watchdog: reload xray when RSS >= ${XRAY_MEM_RELOAD_MB}MiB (every ${MEM_CHECK_INTERVAL_SECONDS}s)"
+    while sleep "${MEM_CHECK_INTERVAL_SECONDS}" & wait $!; do
+        [ "${SHUTTING_DOWN}" = "1" ] && return 0
+        local rss
+        rss="$(xray_rss_mb)"
+        [ -n "${rss}" ] || continue
+        if [ "${rss}" -ge "${XRAY_MEM_RELOAD_MB}" ]; then
+            log "memory-watchdog: xray RSS ${rss}MiB >= ${XRAY_MEM_RELOAD_MB}MiB → reloading xray"
+            kill -USR1 "$$" 2>/dev/null || true
+        fi
+    done
+}
+
 # ---------- signal handling --------------------------------------------------
 
 shutdown() {
@@ -723,6 +761,7 @@ shutdown() {
     SHUTTING_DOWN=1
     log "shutting down"
     [ "${REFRESH_PID}" -gt 0 ] && kill -TERM "${REFRESH_PID}" 2>/dev/null || true
+    [ "${WATCHDOG_PID}" -gt 0 ] && kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
     stop_xray
     exit 0
 }
@@ -759,6 +798,9 @@ main() {
     refresh_loop &
     REFRESH_PID=$!
     log "refresh loop pid=${REFRESH_PID}, interval=${REFRESH_INTERVAL_SECONDS}s"
+
+    memory_watchdog_loop &
+    WATCHDOG_PID=$!
 
     # block until xray exits or a signal forces shutdown.
     # Loop because USR1 trap re-spawns xray and we must wait on the new pid.
