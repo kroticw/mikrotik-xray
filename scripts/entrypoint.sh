@@ -19,7 +19,7 @@ IFS=$'\n\t'
 # ---------- configuration via env ---------------------------------------------
 
 : "${SUBSCRIPTION_URL:?SUBSCRIPTION_URL is required}"
-: "${SUBSCRIPTION_USER_AGENT:=Xray/26.3.27}"
+: "${SUBSCRIPTION_USER_AGENT:=Xray/26.6.1}"
 : "${SUBSCRIPTION_FORMAT:=auto}"          # auto | xray-json | base64
 : "${REFRESH_INTERVAL_SECONDS:=43200}"    # 12h
 : "${TPROXY_PORT:=12345}"

@@ -2,7 +2,7 @@
 
 # Builder stage: fetch and verify xray-core release archive for the target arch.
 ARG ALPINE_VERSION=3.21
-ARG XRAY_VERSION=26.3.27
+ARG XRAY_VERSION=26.6.1
 
 FROM alpine:${ALPINE_VERSION} AS xray-fetch
 ARG XRAY_VERSION
@@ -65,7 +65,7 @@ COPY scripts/entrypoint.sh                    /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 ENV SUBSCRIPTION_URL="" \
-    SUBSCRIPTION_USER_AGENT="Xray/26.3.27" \
+    SUBSCRIPTION_USER_AGENT="Xray/26.6.1" \
     SUBSCRIPTION_FORMAT="auto" \
     REFRESH_INTERVAL_SECONDS="43200" \
     TPROXY_PORT="12345" \
