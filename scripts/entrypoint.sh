@@ -19,9 +19,16 @@ IFS=$'\n\t'
 # ---------- configuration via env ---------------------------------------------
 
 : "${SUBSCRIPTION_URL:?SUBSCRIPTION_URL is required}"
-: "${SUBSCRIPTION_USER_AGENT:=Xray/26.3.27}"
+: "${SUBSCRIPTION_USER_AGENT:=Xray/26.6.1}"
 : "${SUBSCRIPTION_FORMAT:=auto}"          # auto | xray-json | base64
 : "${REFRESH_INTERVAL_SECONDS:=43200}"    # 12h
+# Initial subscription fetch resilience. After a router reboot the container may
+# start before WAN/DNS is up, so the first fetch fails. Without retries the
+# entrypoint exits non-zero and RouterOS restart-policy restarts it, quickly
+# burning restart-max-count and stopping the container for good. Retry in-process
+# instead. Defaults give ~5 min of grace (30 * 10s).
+: "${INITIAL_FETCH_RETRIES:=30}"
+: "${INITIAL_FETCH_RETRY_DELAY:=10}"
 : "${TPROXY_PORT:=12345}"
 : "${SOCKS_PORT:=10808}"
 : "${DNS_PORT:=10853}"
@@ -31,6 +38,13 @@ IFS=$'\n\t'
 : "${XRAY_CONFIG_DIR:=/etc/xray}"
 : "${XRAY_STATE_DIR:=/var/lib/xray}"
 : "${BYPASS_PRIVATE:=1}"
+# Seconds an idle connection is kept before xray reaps it. Each live connection
+# pins a buffer + goroutines; under full-tunnel for several LAN devices these
+# accumulate and drive RSS toward the container's memory-max, where the cgroup
+# OOM-kills xray. A shorter idle window frees that memory sooner. Lowered from
+# xray's 300s default; 90s is a safe trade-off (long-idle SSH/websocket
+# sessions reconnect). Bump if you see legitimate idle connections dropping.
+: "${POLICY_CONN_IDLE:=90}"
 # Additional direct-route matchers, applied BEFORE the balancer.
 # BYPASS_DOMAIN: CSV of xray domain matchers, each may use prefixes
 #   regexp:  — regular expression on the FQDN (e.g. `regexp:\.ru$`)
@@ -45,13 +59,32 @@ IFS=$'\n\t'
 : "${TPROXY_TABLE:=100}"
 : "${REDIRECT_ENABLED:=0}"
 : "${TPROXY_ENABLED:=0}"
+# Geo-database auto-update. The image ships geoip.dat/geosite.dat as a seed;
+# they are copied into a writable dir and periodically refreshed from these
+# URLs. xray reads them via XRAY_LOCATION_ASSET (exported in main). Set the
+# URLs to a reachable mirror if GitHub is blocked. Empty URL disables update
+# of that file (seed/baked-in copy is kept).
+: "${GEODATA_REFRESH_SECONDS:=86400}"     # 24h
+: "${GEODATA_URL_GEOIP:=https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat}"
+: "${GEODATA_URL_GEOSITE:=https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat}"
+# Memory watchdog. xray slowly leaks memory under full-tunnel (unbounded
+# growth from connections that never fully close — XTLS/Xray-core#4054,#4294);
+# policy timeouts only slow it. To avoid the container OOM-killing, reload
+# xray (a ~1-2s in-container restart that resets RSS) once its memory crosses
+# the soft threshold. 0 disables the watchdog.
+: "${XRAY_MEM_RELOAD_MB:=280}"
+: "${MEM_CHECK_INTERVAL_SECONDS:=30}"
 
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 CONFIG_NEW="${XRAY_CONFIG_DIR}/config.json.new"
 HASH_FILE="${XRAY_STATE_DIR}/config.sha256"
+GEODATA_DIR="${XRAY_STATE_DIR}/geodata"
+GEODATA_SEED_DIR="/usr/local/share/xray"
+GEODATA_LAST_RUN=0
 
 XRAY_PID=0
 REFRESH_PID=0
+WATCHDOG_PID=0
 SHUTTING_DOWN=0
 
 # ---------- logging -----------------------------------------------------------
@@ -385,10 +418,34 @@ build_config() {
         --argjson tproxy_port      "${TPROXY_PORT}" \
         --argjson socks_port       "${SOCKS_PORT}" \
         --argjson dns_port         "${DNS_PORT}" \
+        --argjson conn_idle        "${POLICY_CONN_IDLE}" \
         --arg     strategy         "${BALANCER_STRATEGY}" \
         --arg     probe_interval   "${OBSERVATORY_INTERVAL}" \
         '{
             log: { loglevel: $log_level },
+            policy: {
+                # Bound per-connection memory and reap stuck/idle connections.
+                # Under full-tunnel xray holds a buffer + goroutines per LAN
+                # connection; without these caps memory grows unbounded as
+                # half-open/idle connections accumulate (see XTLS/Xray-core
+                # #4054, #4294). bufferSize caps per-direction RAM; connIdle
+                # closes silent connections so they stop pinning memory.
+                levels: {
+                    "0": {
+                        handshake: 4,
+                        connIdle: $conn_idle,
+                        uplinkOnly: 2,
+                        downlinkOnly: 4,
+                        bufferSize: 64
+                    }
+                },
+                system: {
+                    statsInboundUplink: false,
+                    statsInboundDownlink: false,
+                    statsOutboundUplink: false,
+                    statsOutboundDownlink: false
+                }
+            },
             dns: {
                 servers: [
                     { address: "1.1.1.1", domains: ["geosite:geolocation-!cn"] },
@@ -453,6 +510,66 @@ build_config() {
                 probeInterval: $probe_interval
             }
         }'
+}
+
+# ---------- geo-database management ------------------------------------------
+
+# init_geodata: ensure GEODATA_DIR holds usable geoip.dat/geosite.dat, seeding
+# from the image's baked-in copy when absent, and point xray at the writable
+# dir. Must run before the first config validation so geoip:/geosite: matchers
+# resolve.
+init_geodata() {
+    mkdir --parents "${GEODATA_DIR}"
+    local f
+    for f in geoip.dat geosite.dat; do
+        if [ ! -s "${GEODATA_DIR}/${f}" ] && [ -s "${GEODATA_SEED_DIR}/${f}" ]; then
+            cp "${GEODATA_SEED_DIR}/${f}" "${GEODATA_DIR}/${f}"
+            log "geodata: seeded ${f} from image"
+        fi
+    done
+    export XRAY_LOCATION_ASSET="${GEODATA_DIR}"
+}
+
+# fetch_one_geodata <filename> <url>: download atomically into GEODATA_DIR.
+# Returns 10 if the file changed, 0 if unchanged or URL empty, 1 on failure
+# (the existing file is always kept on failure).
+fetch_one_geodata() {
+    local f="$1" url="$2" tmp new_hash old_hash
+    [ -n "${url}" ] || return 0
+    tmp="${GEODATA_DIR}/.${f}.tmp"
+    if ! curl --silent --show-error --fail --location --max-time 120 \
+            --output "${tmp}" "${url}"; then
+        rm --force "${tmp}" 2>/dev/null || true
+        log "geodata: ${f} download failed, keeping existing copy"
+        return 1
+    fi
+    if [ ! -s "${tmp}" ]; then
+        rm --force "${tmp}" 2>/dev/null || true
+        log "geodata: ${f} download empty, skipped"
+        return 1
+    fi
+    new_hash="$(sha256sum "${tmp}" | awk '{print $1}')"
+    old_hash="$(sha256sum "${GEODATA_DIR}/${f}" 2>/dev/null | awk '{print $1}')"
+    if [ "${new_hash}" = "${old_hash}" ]; then
+        rm --force "${tmp}"
+        return 0
+    fi
+    mv --force "${tmp}" "${GEODATA_DIR}/${f}"
+    log "geodata: ${f} updated (${new_hash:0:12})"
+    return 10
+}
+
+# fetch_geodata: refresh both geo files. Returns 10 if any changed (caller
+# should reload xray to pick them up), else 0. Download errors are non-fatal.
+fetch_geodata() {
+    local changed=0 rc
+    rc=0; fetch_one_geodata geoip.dat   "${GEODATA_URL_GEOIP}"   || rc=$?
+    [ "${rc}" -eq 10 ] && changed=1
+    rc=0; fetch_one_geodata geosite.dat "${GEODATA_URL_GEOSITE}" || rc=$?
+    [ "${rc}" -eq 10 ] && changed=1
+    GEODATA_LAST_RUN="$(date +%s)"
+    [ "${changed}" -eq 1 ] && return 10
+    return 0
 }
 
 # ---------- subscription pipeline --------------------------------------------
@@ -601,13 +718,53 @@ stop_xray() {
 refresh_loop() {
     while sleep "${REFRESH_INTERVAL_SECONDS}" & wait $!; do
         if [ "${SHUTTING_DOWN}" = "1" ]; then return 0; fi
-        local rc=0
+        local need_reload=0 rc=0
         refresh_config_once || rc=$?
         if [ "${rc}" -eq 10 ]; then
-            log "config changed → restarting xray"
-            kill -USR1 "$$" 2>/dev/null || true
+            need_reload=1
         elif [ "${rc}" -ne 0 ]; then
             log "refresh failed (rc=${rc}), will retry next cycle"
+        fi
+        # Geo-databases refresh on their own (slower) cadence.
+        local now
+        now="$(date +%s)"
+        if [ "$(( now - GEODATA_LAST_RUN ))" -ge "${GEODATA_REFRESH_SECONDS}" ]; then
+            rc=0; fetch_geodata || rc=$?
+            [ "${rc}" -eq 10 ] && need_reload=1
+        fi
+        if [ "${need_reload}" -eq 1 ]; then
+            log "config/geodata changed → restarting xray"
+            kill -USR1 "$$" 2>/dev/null || true
+        fi
+    done
+}
+
+# xray_rss_mb → echoes the resident set size of the running xray in MiB, or
+# nothing if xray is not found. Uses pidof so it tracks the current pid across
+# reloads (the watchdog runs in a subshell and cannot see XRAY_PID updates).
+xray_rss_mb() {
+    local pid rss_kb
+    pid="$(pidof xray 2>/dev/null | awk '{print $1}')"
+    [ -n "${pid}" ] || return 0
+    rss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/${pid}/status" 2>/dev/null)"
+    [ -n "${rss_kb}" ] && printf '%s' "$(( rss_kb / 1024 ))"
+}
+
+# memory_watchdog_loop: periodically reload xray once its RSS crosses the soft
+# threshold, reclaiming memory before the container hits its hard cgroup limit
+# and gets OOM-killed. Signals the parent (USR1) so reload runs in the main
+# context, like refresh_loop.
+memory_watchdog_loop() {
+    [ "${XRAY_MEM_RELOAD_MB}" -gt 0 ] 2>/dev/null || { log "memory-watchdog disabled"; return 0; }
+    log "memory-watchdog: reload xray when RSS >= ${XRAY_MEM_RELOAD_MB}MiB (every ${MEM_CHECK_INTERVAL_SECONDS}s)"
+    while sleep "${MEM_CHECK_INTERVAL_SECONDS}" & wait $!; do
+        [ "${SHUTTING_DOWN}" = "1" ] && return 0
+        local rss
+        rss="$(xray_rss_mb)"
+        [ -n "${rss}" ] || continue
+        if [ "${rss}" -ge "${XRAY_MEM_RELOAD_MB}" ]; then
+            log "memory-watchdog: xray RSS ${rss}MiB >= ${XRAY_MEM_RELOAD_MB}MiB → reloading xray"
+            kill -USR1 "$$" 2>/dev/null || true
         fi
     done
 }
@@ -619,6 +776,7 @@ shutdown() {
     SHUTTING_DOWN=1
     log "shutting down"
     [ "${REFRESH_PID}" -gt 0 ] && kill -TERM "${REFRESH_PID}" 2>/dev/null || true
+    [ "${WATCHDOG_PID}" -gt 0 ] && kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
     stop_xray
     exit 0
 }
@@ -640,17 +798,33 @@ main() {
 
     setup_inbound
 
+    init_geodata
+    log "refreshing geo-databases (geoip/geosite)"
+    fetch_geodata || true
+
     log "performing initial subscription fetch"
-    local rc=0
-    refresh_config_once || rc=$?
-    if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 10 ]; then
-        die "initial subscription fetch failed"
-    fi
+    local rc=0 attempt=1
+    while :; do
+        rc=0
+        refresh_config_once || rc=$?
+        if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 10 ]; then
+            break
+        fi
+        if [ "${attempt}" -ge "${INITIAL_FETCH_RETRIES}" ]; then
+            die "initial subscription fetch failed after ${attempt} attempts"
+        fi
+        log "initial fetch failed (attempt ${attempt}/${INITIAL_FETCH_RETRIES}), retrying in ${INITIAL_FETCH_RETRY_DELAY}s"
+        attempt=$(( attempt + 1 ))
+        sleep "${INITIAL_FETCH_RETRY_DELAY}"
+    done
 
     start_xray
     refresh_loop &
     REFRESH_PID=$!
     log "refresh loop pid=${REFRESH_PID}, interval=${REFRESH_INTERVAL_SECONDS}s"
+
+    memory_watchdog_loop &
+    WATCHDOG_PID=$!
 
     # block until xray exits or a signal forces shutdown.
     # Loop because USR1 trap re-spawns xray and we must wait on the new pid.

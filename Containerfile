@@ -2,7 +2,7 @@
 
 # Builder stage: fetch and verify xray-core release archive for the target arch.
 ARG ALPINE_VERSION=3.21
-ARG XRAY_VERSION=26.3.27
+ARG XRAY_VERSION=26.6.1
 
 FROM alpine:${ALPINE_VERSION} AS xray-fetch
 ARG XRAY_VERSION
@@ -65,7 +65,7 @@ COPY scripts/entrypoint.sh                    /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 ENV SUBSCRIPTION_URL="" \
-    SUBSCRIPTION_USER_AGENT="Xray/26.3.27" \
+    SUBSCRIPTION_USER_AGENT="Xray/26.6.1" \
     SUBSCRIPTION_FORMAT="auto" \
     REFRESH_INTERVAL_SECONDS="43200" \
     TPROXY_PORT="12345" \
@@ -87,6 +87,17 @@ LABEL org.opencontainers.image.title="xray-container" \
       org.opencontainers.image.licenses="MPL-2.0" \
       org.opencontainers.image.source="https://github.com/davydovd/xray-container" \
       org.opencontainers.image.version="${XRAY_VERSION}"
+
+# Healthcheck: end-to-end probe through the SOCKS inbound. Proves xray is not
+# just alive but actually proxying — the same generate_204 target the
+# observatory uses. start-period covers the initial subscription fetch.
+# RouterOS surfaces the result as the HEALTHY/UNHEALTHY container flag; pair
+# with stop-on-unhealthy on the host if automatic restart-on-hang is wanted.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl --silent --fail --max-time 8 \
+        --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+        --output /dev/null \
+        "http://www.gstatic.com/generate_204" || exit 1
 
 # tini reaps zombies and forwards signals so xray/refresher exit cleanly.
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
