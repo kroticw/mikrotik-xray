@@ -31,6 +31,13 @@ IFS=$'\n\t'
 : "${XRAY_CONFIG_DIR:=/etc/xray}"
 : "${XRAY_STATE_DIR:=/var/lib/xray}"
 : "${BYPASS_PRIVATE:=1}"
+# Seconds an idle connection is kept before xray reaps it. Each live connection
+# pins a buffer + goroutines; under full-tunnel for several LAN devices these
+# accumulate and drive RSS toward the container's memory-max, where the cgroup
+# OOM-kills xray. A shorter idle window frees that memory sooner. Lowered from
+# xray's 300s default; 90s is a safe trade-off (long-idle SSH/websocket
+# sessions reconnect). Bump if you see legitimate idle connections dropping.
+: "${POLICY_CONN_IDLE:=90}"
 # Additional direct-route matchers, applied BEFORE the balancer.
 # BYPASS_DOMAIN: CSV of xray domain matchers, each may use prefixes
 #   regexp:  — regular expression on the FQDN (e.g. `regexp:\.ru$`)
@@ -404,6 +411,7 @@ build_config() {
         --argjson tproxy_port      "${TPROXY_PORT}" \
         --argjson socks_port       "${SOCKS_PORT}" \
         --argjson dns_port         "${DNS_PORT}" \
+        --argjson conn_idle        "${POLICY_CONN_IDLE}" \
         --arg     strategy         "${BALANCER_STRATEGY}" \
         --arg     probe_interval   "${OBSERVATORY_INTERVAL}" \
         '{
@@ -418,7 +426,7 @@ build_config() {
                 levels: {
                     "0": {
                         handshake: 4,
-                        connIdle: 180,
+                        connIdle: $conn_idle,
                         uplinkOnly: 2,
                         downlinkOnly: 4,
                         bufferSize: 64
