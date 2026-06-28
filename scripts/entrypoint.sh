@@ -22,6 +22,13 @@ IFS=$'\n\t'
 : "${SUBSCRIPTION_USER_AGENT:=Xray/26.6.1}"
 : "${SUBSCRIPTION_FORMAT:=auto}"          # auto | xray-json | base64
 : "${REFRESH_INTERVAL_SECONDS:=43200}"    # 12h
+# Initial subscription fetch resilience. After a router reboot the container may
+# start before WAN/DNS is up, so the first fetch fails. Without retries the
+# entrypoint exits non-zero and RouterOS restart-policy restarts it, quickly
+# burning restart-max-count and stopping the container for good. Retry in-process
+# instead. Defaults give ~5 min of grace (30 * 10s).
+: "${INITIAL_FETCH_RETRIES:=30}"
+: "${INITIAL_FETCH_RETRY_DELAY:=10}"
 : "${TPROXY_PORT:=12345}"
 : "${SOCKS_PORT:=10808}"
 : "${DNS_PORT:=10853}"
@@ -796,11 +803,20 @@ main() {
     fetch_geodata || true
 
     log "performing initial subscription fetch"
-    local rc=0
-    refresh_config_once || rc=$?
-    if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 10 ]; then
-        die "initial subscription fetch failed"
-    fi
+    local rc=0 attempt=1
+    while :; do
+        rc=0
+        refresh_config_once || rc=$?
+        if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 10 ]; then
+            break
+        fi
+        if [ "${attempt}" -ge "${INITIAL_FETCH_RETRIES}" ]; then
+            die "initial subscription fetch failed after ${attempt} attempts"
+        fi
+        log "initial fetch failed (attempt ${attempt}/${INITIAL_FETCH_RETRIES}), retrying in ${INITIAL_FETCH_RETRY_DELAY}s"
+        attempt=$(( attempt + 1 ))
+        sleep "${INITIAL_FETCH_RETRY_DELAY}"
+    done
 
     start_xray
     refresh_loop &
