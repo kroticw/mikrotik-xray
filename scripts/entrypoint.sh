@@ -2,10 +2,11 @@
 # entrypoint.sh — supervisor for xray-core fed by a Remnawave subscription URL.
 #
 # Responsibilities:
-#   1. Pull the subscription (xray-json or base64 of vless:// links, autodetected).
+#   1. Pull the subscription (xray-json, or base64 of vless:// / ss:// links,
+#      autodetected).
 #   2. Build a complete xray config: TPROXY + SOCKS5 + DNS inbounds, a
-#      `proxy` balancer over all VLESS outbounds, routing that bypasses
-#      private/loopback, and an observatory for leastPing.
+#      `proxy` balancer over all VLESS/Shadowsocks outbounds, routing that
+#      bypasses private/loopback, and an observatory for leastPing.
 #   3. Configure host-side TPROXY rules (PREROUTING + ip rule) if CAP_NET_ADMIN
 #      is granted; otherwise warn and continue with SOCKS only.
 #   4. Run xray, periodically re-fetch the subscription, and atomically
@@ -310,6 +311,78 @@ parse_vless_uri() {
         }'
 }
 
+# parse_ss_uri <uri> <tag> → emits one xray shadowsocks outbound JSON, or nothing
+# Returns non-zero if the URI is not a usable ss:// link. SIP002 form:
+#   ss://base64(method:password)@host:port#name
+# For the 2022-* methods the password is itself "serverKey:userKey" (a colon),
+# so the method is split off at the FIRST colon and the rest is the password.
+parse_ss_uri() {
+    local uri="$1"
+    local tag="$2"
+
+    [[ "${uri}" =~ ^ss:// ]] || return 1
+    local body="${uri#ss://}"
+    body="${body%%#*}"
+
+    # A SIP003 plugin (?plugin=…) needs transport we do not model here; skip it.
+    if [[ "${body}" == *\?* ]]; then
+        log "skip ${tag}: ss plugin not supported"
+        return 1
+    fi
+
+    local userinfo hostport
+    userinfo="${body%%@*}"
+    hostport="${body#*@}"
+    [ "${userinfo}" = "${hostport}" ] && return 1   # no '@' → malformed
+
+    local host port
+    if [[ "${hostport}" == \[*\]:* ]]; then
+        host="${hostport%%]*}"; host="${host#\[}"; port="${hostport##*:}"
+    else
+        host="${hostport%%:*}"; port="${hostport##*:}"
+    fi
+
+    # userinfo is base64(method:password); SIP002 also allows plain
+    # method:password. The base64 alphabet has no ':' so its presence marks the
+    # plain form.
+    local creds
+    if [[ "${userinfo}" == *:* ]]; then
+        creds="$(urldecode "${userinfo}")"
+    else
+        local u="${userinfo//-/+}"; u="${u//_//}"
+        local pad=$(( (4 - ${#u} % 4) % 4 ))
+        u="${u}$(printf '=%.0s' $(seq 1 "${pad}"))"
+        creds="$(printf '%s' "${u}" | base64 -d 2>/dev/null || true)"
+    fi
+    [ -n "${creds}" ] || return 1
+
+    local method password
+    method="${creds%%:*}"
+    password="${creds#*:}"
+    [[ -n "${host}" && -n "${port}" && -n "${method}" && -n "${password}" ]] || return 1
+
+    jq --null-input \
+        --arg     tag      "${tag}" \
+        --arg     addr     "${host}" \
+        --argjson port     "${port}" \
+        --arg     method   "${method}" \
+        --arg     password "${password}" \
+        '{
+            tag: $tag,
+            protocol: "shadowsocks",
+            settings: {
+                servers: [{
+                    address: $addr,
+                    port: $port,
+                    method: $method,
+                    password: $password,
+                    uot: false
+                }]
+            },
+            streamSettings: { network: "tcp" }
+        }'
+}
+
 # parse_base64_subscription <raw> → emits a JSON array of outbounds
 parse_base64_subscription() {
     local raw="$1"
@@ -323,32 +396,40 @@ parse_base64_subscription() {
     [ -n "${decoded}" ] || die "failed to base64-decode subscription"
 
     local out='[]'
-    local line idx=0 tag name
+    local line idx=0 tag name prefix
     while IFS= read -r line; do
         line="$(printf '%s' "${line}" | tr -d '\r')"
         [ -z "${line}" ] && continue
+        # dispatch by URI scheme; tag prefix doubles as the balancer selector.
+        case "${line}" in
+            vless://*) prefix="vless" ;;
+            ss://*)    prefix="ss" ;;
+            *) idx=$(( idx + 1 )); log "skip line ${idx}: unsupported scheme"; continue ;;
+        esac
         # extract name from #fragment for human-readable tag
         name=""
         if [[ "${line}" == *\#* ]]; then
             name="$(urldecode "${line#*#}")"
         fi
         idx=$(( idx + 1 ))
-        tag="vless-$(printf '%s' "${name:-server-${idx}}" \
+        tag="${prefix}-$(printf '%s' "${name:-server-${idx}}" \
             | tr ' /:' '___' | tr -cd 'A-Za-z0-9._-' | cut -c1-48)"
         # ensure uniqueness if names collide
         tag="${tag}-${idx}"
 
         local outbound preview
         # Truncate URI for logging without leaking the UUID/key fully.
-        preview="$(printf '%s' "${line}" | cut -c1-12)…$(printf '%s' "${line}" | awk -F'?' '{print "?" substr($2,1,40)}')"
-        if outbound="$(parse_vless_uri "${line}" "${tag}")"; then
+        preview="$(printf '%s' "${line}" | cut -c1-12)…"
+        if [ "${prefix}" = "ss" ] && outbound="$(parse_ss_uri "${line}" "${tag}")"; then
+            out="$(printf '%s' "${out}" | jq --argjson o "${outbound}" '. + [$o]')"
+        elif [ "${prefix}" = "vless" ] && outbound="$(parse_vless_uri "${line}" "${tag}")"; then
             out="$(printf '%s' "${out}" | jq --argjson o "${outbound}" '. + [$o]')"
         else
             log "skip line ${idx}: ${preview}"
         fi
     done <<< "${decoded}"
 
-    [ "$(printf '%s' "${out}" | jq 'length')" -gt 0 ] || die "no vless outbounds parsed from base64 subscription"
+    [ "$(printf '%s' "${out}" | jq 'length')" -gt 0 ] || die "no usable outbounds parsed from base64 subscription"
     printf '%s' "${out}"
 }
 
@@ -362,14 +443,16 @@ parse_xray_json_subscription() {
         elif type == "array" then .
         else error("not an xray config")
         end
-        | map(select(.protocol == "vless"))
+        | map(select(.protocol == "vless" or .protocol == "shadowsocks"))
     ' 2>/dev/null)" && [ "$(printf '%s' "${outbounds}" | jq 'length')" -gt 0 ]; then
-        # ensure tags exist and are prefixed
+        # ensure tags exist and carry a protocol-appropriate selector prefix
         printf '%s' "${outbounds}" | jq -c '
             to_entries | map(
-                (.value.tag //= ("vless-server-" + ((.key+1)|tostring)))
-                | (if (.value.tag | startswith("vless-")) then .value
-                   else .value + {tag: ("vless-" + .value.tag)}
+                (if .value.protocol == "shadowsocks" then "ss-" else "vless-" end) as $pfx
+                | (.value.tag //= ($pfx + "server-" + ((.key+1)|tostring)))
+                | (if (.value.tag | startswith("vless-")) or (.value.tag | startswith("ss-"))
+                   then .value
+                   else .value + {tag: ($pfx + .value.tag)}
                    end)
             )
         '
@@ -383,9 +466,9 @@ parse_xray_json_subscription() {
 build_config() {
     local outbounds_json="$1"
 
-    # selector accepts tag prefixes; "vless-" matches every tag we emit in
-    # parse_vless_uri / parse_xray_json_subscription. observatory uses the same.
-    local selector_prefix='["vless-"]'
+    # selector accepts tag prefixes; "vless-"/"ss-" match every tag we emit in
+    # the URI / xray-json parsers. observatory uses the same set.
+    local selector_prefix='["vless-","ss-"]'
 
     local privacy_rules='[]'
     if [ "${BYPASS_PRIVATE}" = "1" ]; then
@@ -628,7 +711,7 @@ refresh_config_once() {
 
     if [ "${format}" = "xray-json" ]; then
         if ! outbounds="$(parse_xray_json_subscription "${raw}")"; then
-            log "xray-json had no vless outbounds, falling back to base64"
+            log "xray-json had no usable outbounds, falling back to base64"
             outbounds="$(parse_base64_subscription "${raw}")"
         fi
     else
@@ -637,7 +720,7 @@ refresh_config_once() {
 
     local count
     count="$(printf '%s' "${outbounds}" | jq 'length')"
-    log "parsed ${count} vless outbound(s)"
+    log "parsed ${count} proxy outbound(s)"
 
     build_config "${outbounds}" > "${CONFIG_NEW}"
     log "validating new config"

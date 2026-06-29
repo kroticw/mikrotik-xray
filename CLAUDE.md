@@ -8,8 +8,8 @@ A container image that runs [xray-core](https://github.com/XTLS/Xray-core)
 fed by a Remnawave subscription URL, built to run inside a **MikroTik
 RouterOS container** (primarily arm64, e.g. hAP ax3). It pulls the
 subscription, builds a full xray config (TPROXY/REDIRECT + SOCKS + DNS
-inbounds, a balancer over the VLESS outbounds, routing with bypass rules),
-runs xray, and keeps it alive.
+inbounds, a balancer over the VLESS/Shadowsocks outbounds, routing with
+bypass rules), runs xray, and keeps it alive.
 
 License: MPL-2.0. This is a **public** repository — never commit secrets
 (subscription URLs/tokens), router IPs/MACs/serials, or other private
@@ -22,7 +22,7 @@ infrastructure details.
   stage is Alpine + xray + a non-root user, with a `HEALTHCHECK` that probes
   xray end-to-end through the SOCKS inbound.
 - `scripts/entrypoint.sh` — the supervisor. Subscription fetch + parse
-  (base64 vless:// links or xray-json, autodetected), config build via `jq`,
+  (base64 vless:// / ss:// links or xray-json, autodetected), config build via `jq`,
   host-side REDIRECT/TPROXY setup, xray process management, periodic refresh,
   geo-database auto-update, and a memory watchdog.
 - `build.sh` — builds for `linux/arm64`, exports an OCI tar, optionally
