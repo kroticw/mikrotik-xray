@@ -44,12 +44,14 @@ IFS=$'\n\t'
 : "${XRAY_STATE_DIR:=/var/lib/xray}"
 : "${BYPASS_PRIVATE:=1}"
 # Seconds an idle connection is kept before xray reaps it. Each live connection
-# pins a buffer + goroutines; under full-tunnel for several LAN devices these
-# accumulate and drive RSS toward the container's memory-max, where the cgroup
-# OOM-kills xray. A shorter idle window frees that memory sooner. Lowered from
-# xray's 300s default; 90s is a safe trade-off (long-idle SSH/websocket
-# sessions reconnect). Bump if you see legitimate idle connections dropping.
-: "${POLICY_CONN_IDLE:=90}"
+# pins a buffer + goroutines; under full-tunnel the steady-state count is
+# roughly (new-connections/sec * POLICY_CONN_IDLE), so this value sets the
+# memory *ceiling*, not just the drain rate — at 90s a busy household plateaus
+# near the cgroup memory-max and the kernel OOM-kills. A shorter window lowers
+# that plateau proportionally. Requires userLevel:0 on the inbounds (set in the
+# generated config) for the policy to apply at all. 30s keeps the plateau well
+# under the cap; raise it if long-idle SSH/websocket sessions drop too eagerly.
+: "${POLICY_CONN_IDLE:=30}"
 # Additional direct-route matchers, applied BEFORE the balancer.
 # BYPASS_DOMAIN: CSV of xray domain matchers, each may use prefixes
 #   regexp:  — regular expression on the FQDN (e.g. `regexp:\.ru$`)
@@ -489,7 +491,14 @@ build_config() {
                     listen: "0.0.0.0",
                     port: $tproxy_port,
                     protocol: "dokodemo-door",
-                    settings: { network: "tcp", followRedirect: true },
+                    # userLevel ties this inbound to policy.levels."0" so connIdle
+                    # actually reaps its connections; sockopt enables TCP keepalive
+                    # (off by default on inbounds) so the kernel detects LAN clients
+                    # that vanished without a FIN and closes the dangling upstream
+                    # leg — together they cap the established-connection backlog
+                    # (REALITY dangling connections, XTLS/Xray-core #5247, #4586).
+                    settings: { network: "tcp", followRedirect: true, userLevel: 0 },
+                    streamSettings: { sockopt: { tcpKeepAliveIdle: 30, tcpKeepAliveInterval: 15 } },
                     sniffing: { enabled: true, destOverride: ["http","tls","quic"], routeOnly: false }
                 },
                 {
@@ -497,7 +506,8 @@ build_config() {
                     listen: "0.0.0.0",
                     port: $socks_port,
                     protocol: "socks",
-                    settings: { auth: "noauth", udp: true },
+                    settings: { auth: "noauth", udp: true, userLevel: 0 },
+                    streamSettings: { sockopt: { tcpKeepAliveIdle: 30, tcpKeepAliveInterval: 15 } },
                     sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
                 },
                 {
