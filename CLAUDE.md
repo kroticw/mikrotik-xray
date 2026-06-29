@@ -76,13 +76,25 @@ cause here — confirm via the logs before assuming.
 Keep these monotonic so the soft mechanisms fire before the hard kill:
 
 ```
-GOMEMLIMIT  <  XRAY_MEM_RELOAD_MB (watchdog)  <  memory-high  <  memory-max
+GOMEMLIMIT  <  XRAY_MEM_RELOAD_MB (watchdog)  <  cgroup reload (% of max)  <  memory-high  <  memory-max
 ```
+
+The OOM-killer acts on the **cgroup** memory (anon + kernel socket buffers +
+mmap'd geodata), which `VmRSS` undercounts — on a RAM-tight router the cgroup
+reaches `memory-max` while `VmRSS` is still below `XRAY_MEM_RELOAD_MB`, so an
+RSS-only watchdog never fires and the kernel hard-kills first. The watchdog
+therefore reloads on **either** signal, whichever trips first.
 
 Relevant knobs:
 
-- `XRAY_MEM_RELOAD_MB` / `MEM_CHECK_INTERVAL_SECONDS` — watchdog reloads xray
-  when RSS crosses the threshold; a short interval is what catches load
+- `XRAY_CGROUP_RELOAD_PCT` (default 85) — reload when the container's own
+  cgroup memory crosses this percentage of its `memory-max`. This is the
+  primary guard; keep it just below `memory-high` so the reload lands before
+  the kernel's reclaim throttle (which stalls xray and trips the healthcheck).
+  0 disables the cgroup check. `MEM_RELOAD_COOLDOWN_SECONDS` (default 30) is
+  the post-reload settle window before checks resume.
+- `XRAY_MEM_RELOAD_MB` / `MEM_CHECK_INTERVAL_SECONDS` — RSS fallback: reload
+  xray when VmRSS crosses the threshold; a short interval is what catches load
   spikes before the OOM kill.
 - `GOMEMLIMIT`, `GOGC` — Go GC pressure (soft heap target; does not cap
   goroutine stacks, so it cannot prevent OOM on its own).

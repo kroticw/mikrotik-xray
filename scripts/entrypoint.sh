@@ -79,6 +79,20 @@ IFS=$'\n\t'
 # the soft threshold. 0 disables the watchdog.
 : "${XRAY_MEM_RELOAD_MB:=280}"
 : "${MEM_CHECK_INTERVAL_SECONDS:=30}"
+# The RSS threshold above misses memory the cgroup OOM-killer counts but VmRSS
+# does not: mmap'd geodata and kernel socket buffers for the many full-tunnel
+# connections. On a RAM-tight router the cgroup reaches memory-max while VmRSS
+# is still under XRAY_MEM_RELOAD_MB, so the kernel hard-kills (signal 9) before
+# the RSS watchdog ever fires. So also reload when the container's own cgroup
+# memory crosses this percentage of its memory-max — the exact figure the
+# OOM-killer acts on. Kept just under memory-high so the reload lands before
+# the kernel's reclaim throttle (which stalls xray and trips the healthcheck).
+# 0 disables the cgroup check. CGROUP_ROOT is overridable for testing.
+: "${XRAY_CGROUP_RELOAD_PCT:=85}"
+: "${CGROUP_ROOT:=/sys/fs/cgroup}"
+# After a reload, wait this long before resuming memory checks so freed memory
+# settles and a slow drop does not trigger a second back-to-back reload.
+: "${MEM_RELOAD_COOLDOWN_SECONDS:=30}"
 
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 CONFIG_NEW="${XRAY_CONFIG_DIR}/config.json.new"
@@ -778,21 +792,82 @@ xray_rss_mb() {
     [ -n "${rss_kb}" ] && printf '%s' "$(( rss_kb / 1024 ))"
 }
 
-# memory_watchdog_loop: periodically reload xray once its RSS crosses the soft
-# threshold, reclaiming memory before the container hits its hard cgroup limit
-# and gets OOM-killed. Signals the parent (USR1) so reload runs in the main
-# context, like refresh_loop.
+# cgroup_mem_used_mb / cgroup_mem_limit_mb → the container's own memory cgroup
+# current usage and hard limit in MiB, or nothing if unreadable. This counts
+# what the kernel OOM-killer acts on (anonymous memory + kernel socket buffers
+# + mmap'd geodata), which VmRSS alone undercounts. Handles cgroup v2
+# (memory.current / memory.max) and v1 (memory.usage_in_bytes /
+# memory.limit_in_bytes).
+cgroup_mem_used_mb() {
+    local bytes=""
+    if [ -r "${CGROUP_ROOT}/memory.current" ]; then
+        bytes="$(cat "${CGROUP_ROOT}/memory.current" 2>/dev/null)"
+    elif [ -r "${CGROUP_ROOT}/memory/memory.usage_in_bytes" ]; then
+        bytes="$(cat "${CGROUP_ROOT}/memory/memory.usage_in_bytes" 2>/dev/null)"
+    fi
+    case "${bytes}" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$(( bytes / 1048576 ))"
+}
+
+cgroup_mem_limit_mb() {
+    local raw=""
+    if [ -r "${CGROUP_ROOT}/memory.max" ]; then
+        raw="$(cat "${CGROUP_ROOT}/memory.max" 2>/dev/null)"
+    elif [ -r "${CGROUP_ROOT}/memory/memory.limit_in_bytes" ]; then
+        raw="$(cat "${CGROUP_ROOT}/memory/memory.limit_in_bytes" 2>/dev/null)"
+    fi
+    # "max" (v2) means unlimited; so does the astronomically large v1 sentinel.
+    [ "${raw}" = "max" ] && return 0
+    case "${raw}" in ''|*[!0-9]*) return 0 ;; esac
+    [ "${raw}" -gt 1125899906842624 ] 2>/dev/null && return 0   # > 1 PiB ≈ unlimited
+    printf '%s' "$(( raw / 1048576 ))"
+}
+
+# memory_watchdog_loop: periodically reload xray before the container hits its
+# hard cgroup limit and gets OOM-killed, reclaiming the leaked memory. Two
+# independent triggers, whichever fires first:
+#   1. cgroup memory >= XRAY_CGROUP_RELOAD_PCT% of the cgroup limit — the figure
+#      the kernel OOM-killer actually acts on (catches mmap/socket memory that
+#      VmRSS misses). This is the primary guard.
+#   2. xray VmRSS >= XRAY_MEM_RELOAD_MB — a fallback that still catches a pure
+#      heap spike and works if the cgroup files are unreadable.
+# Signals the parent (USR1) so the reload runs in the main context, like
+# refresh_loop, then cools down so a slow post-reload drop is not re-triggered.
 memory_watchdog_loop() {
-    [ "${XRAY_MEM_RELOAD_MB}" -gt 0 ] 2>/dev/null || { log "memory-watchdog disabled"; return 0; }
-    log "memory-watchdog: reload xray when RSS >= ${XRAY_MEM_RELOAD_MB}MiB (every ${MEM_CHECK_INTERVAL_SECONDS}s)"
+    local rss_on=0 cg_on=0
+    [ "${XRAY_MEM_RELOAD_MB}" -gt 0 ] 2>/dev/null && rss_on=1
+    [ "${XRAY_CGROUP_RELOAD_PCT}" -gt 0 ] 2>/dev/null && cg_on=1
+    if [ "${rss_on}" -eq 0 ] && [ "${cg_on}" -eq 0 ]; then
+        log "memory-watchdog disabled"; return 0
+    fi
+    log "memory-watchdog: reload xray when cgroup mem >= ${XRAY_CGROUP_RELOAD_PCT}% of limit or RSS >= ${XRAY_MEM_RELOAD_MB}MiB (every ${MEM_CHECK_INTERVAL_SECONDS}s)"
     while sleep "${MEM_CHECK_INTERVAL_SECONDS}" & wait $!; do
         [ "${SHUTTING_DOWN}" = "1" ] && return 0
-        local rss
-        rss="$(xray_rss_mb)"
-        [ -n "${rss}" ] || continue
-        if [ "${rss}" -ge "${XRAY_MEM_RELOAD_MB}" ]; then
-            log "memory-watchdog: xray RSS ${rss}MiB >= ${XRAY_MEM_RELOAD_MB}MiB → reloading xray"
-            kill -USR1 "$$" 2>/dev/null || true
+        # Primary: cgroup memory vs the OOM-killer's own threshold.
+        if [ "${cg_on}" -eq 1 ]; then
+            local used limit thresh
+            used="$(cgroup_mem_used_mb)"
+            limit="$(cgroup_mem_limit_mb)"
+            if [ -n "${used}" ] && [ -n "${limit}" ] && [ "${limit}" -gt 0 ]; then
+                thresh="$(( limit * XRAY_CGROUP_RELOAD_PCT / 100 ))"
+                if [ "${used}" -ge "${thresh}" ]; then
+                    log "memory-watchdog: cgroup mem ${used}MiB >= ${thresh}MiB (${XRAY_CGROUP_RELOAD_PCT}% of ${limit}MiB) → reloading xray"
+                    kill -USR1 "$$" 2>/dev/null || true
+                    sleep "${MEM_RELOAD_COOLDOWN_SECONDS}" & wait $!
+                    continue
+                fi
+            fi
+        fi
+        # Fallback: xray heap spike.
+        if [ "${rss_on}" -eq 1 ]; then
+            local rss
+            rss="$(xray_rss_mb)"
+            [ -n "${rss}" ] || continue
+            if [ "${rss}" -ge "${XRAY_MEM_RELOAD_MB}" ]; then
+                log "memory-watchdog: xray RSS ${rss}MiB >= ${XRAY_MEM_RELOAD_MB}MiB → reloading xray"
+                kill -USR1 "$$" 2>/dev/null || true
+                sleep "${MEM_RELOAD_COOLDOWN_SECONDS}" & wait $!
+            fi
         fi
     done
 }
