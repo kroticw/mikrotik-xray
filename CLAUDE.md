@@ -85,6 +85,23 @@ reaches `memory-max` while `VmRSS` is still below `XRAY_MEM_RELOAD_MB`, so an
 RSS-only watchdog never fires and the kernel hard-kills first. The watchdog
 therefore reloads on **either** signal, whichever trips first.
 
+**Capacity is per-connection, not throughput.** The dominant driver is the
+*number* of live connections, each pinning a relay buffer plus protocol state.
+A full-tunnel client that fans out thousands of low-bandwidth connections (e.g.
+a Telegram client that cannot be bypassed) is what drives the cgroup to the
+cap, not raw speed. Two levers set the per-connection cost:
+
+- `policy.levels."0".bufferSize` (in the generated config) — relay buffer per
+  direction, in KB. xray's arm64 default is **4**; an earlier config used 64
+  (16×), which alone turned a ~6000-connection storm into an OOM. Measured on
+  the hAP ax3: bufferSize 4 → ~100-150 MiB, 16 → ~520 MiB (hits `memory-max`),
+  64 → OOM. The link is ~200 Mbit/s and saturates on a single stream, so a
+  bigger buffer buys no throughput — keep it at 4.
+- Outbound protocol — VLESS/REALITY carries TLS + REALITY session state per
+  connection; Shadowsocks-2022 carries only an AEAD cipher context, so an
+  SS-only subscription has a meaningfully smaller per-connection footprint
+  (the trade-off is weaker DPI camouflage than REALITY).
+
 Relevant knobs:
 
 - `XRAY_CGROUP_RELOAD_PCT` (default 85) — reload when the container's own
@@ -98,8 +115,9 @@ Relevant knobs:
   spikes before the OOM kill.
 - `GOMEMLIMIT`, `GOGC` — Go GC pressure (soft heap target; does not cap
   goroutine stacks, so it cannot prevent OOM on its own).
-- `POLICY_CONN_IDLE` (default 90s) — idle-connection reap window; shorter
-  frees per-connection memory sooner.
+- `POLICY_CONN_IDLE` (default 30s) — idle-connection reap window; shorter
+  frees per-connection memory sooner. Requires `userLevel:0` on the inbounds
+  (set in the generated config) for the policy to apply.
 - RouterOS `memory-high` (soft, reclaim pressure) and `memory-max` (hard).
 
 ## xray-core versioning
