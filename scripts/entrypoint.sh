@@ -2,10 +2,11 @@
 # entrypoint.sh — supervisor for xray-core fed by a Remnawave subscription URL.
 #
 # Responsibilities:
-#   1. Pull the subscription (xray-json or base64 of vless:// links, autodetected).
+#   1. Pull the subscription (xray-json, or base64 of vless:// / ss:// links,
+#      autodetected).
 #   2. Build a complete xray config: TPROXY + SOCKS5 + DNS inbounds, a
-#      `proxy` balancer over all VLESS outbounds, routing that bypasses
-#      private/loopback, and an observatory for leastPing.
+#      `proxy` balancer over all VLESS/Shadowsocks outbounds, routing that
+#      bypasses private/loopback, and an observatory for leastPing.
 #   3. Configure host-side TPROXY rules (PREROUTING + ip rule) if CAP_NET_ADMIN
 #      is granted; otherwise warn and continue with SOCKS only.
 #   4. Run xray, periodically re-fetch the subscription, and atomically
@@ -44,12 +45,14 @@ IFS=$'\n\t'
 : "${XRAY_STATE_DIR:=/var/lib/xray}"
 : "${BYPASS_PRIVATE:=1}"
 # Seconds an idle connection is kept before xray reaps it. Each live connection
-# pins a buffer + goroutines; under full-tunnel for several LAN devices these
-# accumulate and drive RSS toward the container's memory-max, where the cgroup
-# OOM-kills xray. A shorter idle window frees that memory sooner. Lowered from
-# xray's 300s default; 90s is a safe trade-off (long-idle SSH/websocket
-# sessions reconnect). Bump if you see legitimate idle connections dropping.
-: "${POLICY_CONN_IDLE:=90}"
+# pins a buffer + goroutines; under full-tunnel the steady-state count is
+# roughly (new-connections/sec * POLICY_CONN_IDLE), so this value sets the
+# memory *ceiling*, not just the drain rate — at 90s a busy household plateaus
+# near the cgroup memory-max and the kernel OOM-kills. A shorter window lowers
+# that plateau proportionally. Requires userLevel:0 on the inbounds (set in the
+# generated config) for the policy to apply at all. 30s keeps the plateau well
+# under the cap; raise it if long-idle SSH/websocket sessions drop too eagerly.
+: "${POLICY_CONN_IDLE:=30}"
 # Additional direct-route matchers, applied BEFORE the balancer.
 # BYPASS_DOMAIN: CSV of xray domain matchers, each may use prefixes
 #   regexp:  — regular expression on the FQDN (e.g. `regexp:\.ru$`)
@@ -79,6 +82,20 @@ IFS=$'\n\t'
 # the soft threshold. 0 disables the watchdog.
 : "${XRAY_MEM_RELOAD_MB:=280}"
 : "${MEM_CHECK_INTERVAL_SECONDS:=30}"
+# The RSS threshold above misses memory the cgroup OOM-killer counts but VmRSS
+# does not: mmap'd geodata and kernel socket buffers for the many full-tunnel
+# connections. On a RAM-tight router the cgroup reaches memory-max while VmRSS
+# is still under XRAY_MEM_RELOAD_MB, so the kernel hard-kills (signal 9) before
+# the RSS watchdog ever fires. So also reload when the container's own cgroup
+# memory crosses this percentage of its memory-max — the exact figure the
+# OOM-killer acts on. Kept just under memory-high so the reload lands before
+# the kernel's reclaim throttle (which stalls xray and trips the healthcheck).
+# 0 disables the cgroup check. CGROUP_ROOT is overridable for testing.
+: "${XRAY_CGROUP_RELOAD_PCT:=85}"
+: "${CGROUP_ROOT:=/sys/fs/cgroup}"
+# After a reload, wait this long before resuming memory checks so freed memory
+# settles and a slow drop does not trigger a second back-to-back reload.
+: "${MEM_RELOAD_COOLDOWN_SECONDS:=30}"
 
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 CONFIG_NEW="${XRAY_CONFIG_DIR}/config.json.new"
@@ -294,6 +311,78 @@ parse_vless_uri() {
         }'
 }
 
+# parse_ss_uri <uri> <tag> → emits one xray shadowsocks outbound JSON, or nothing
+# Returns non-zero if the URI is not a usable ss:// link. SIP002 form:
+#   ss://base64(method:password)@host:port#name
+# For the 2022-* methods the password is itself "serverKey:userKey" (a colon),
+# so the method is split off at the FIRST colon and the rest is the password.
+parse_ss_uri() {
+    local uri="$1"
+    local tag="$2"
+
+    [[ "${uri}" =~ ^ss:// ]] || return 1
+    local body="${uri#ss://}"
+    body="${body%%#*}"
+
+    # A SIP003 plugin (?plugin=…) needs transport we do not model here; skip it.
+    if [[ "${body}" == *\?* ]]; then
+        log "skip ${tag}: ss plugin not supported"
+        return 1
+    fi
+
+    local userinfo hostport
+    userinfo="${body%%@*}"
+    hostport="${body#*@}"
+    [ "${userinfo}" = "${hostport}" ] && return 1   # no '@' → malformed
+
+    local host port
+    if [[ "${hostport}" == \[*\]:* ]]; then
+        host="${hostport%%]*}"; host="${host#\[}"; port="${hostport##*:}"
+    else
+        host="${hostport%%:*}"; port="${hostport##*:}"
+    fi
+
+    # userinfo is base64(method:password); SIP002 also allows plain
+    # method:password. The base64 alphabet has no ':' so its presence marks the
+    # plain form.
+    local creds
+    if [[ "${userinfo}" == *:* ]]; then
+        creds="$(urldecode "${userinfo}")"
+    else
+        local u="${userinfo//-/+}"; u="${u//_//}"
+        local pad=$(( (4 - ${#u} % 4) % 4 ))
+        u="${u}$(printf '=%.0s' $(seq 1 "${pad}"))"
+        creds="$(printf '%s' "${u}" | base64 -d 2>/dev/null || true)"
+    fi
+    [ -n "${creds}" ] || return 1
+
+    local method password
+    method="${creds%%:*}"
+    password="${creds#*:}"
+    [[ -n "${host}" && -n "${port}" && -n "${method}" && -n "${password}" ]] || return 1
+
+    jq --null-input \
+        --arg     tag      "${tag}" \
+        --arg     addr     "${host}" \
+        --argjson port     "${port}" \
+        --arg     method   "${method}" \
+        --arg     password "${password}" \
+        '{
+            tag: $tag,
+            protocol: "shadowsocks",
+            settings: {
+                servers: [{
+                    address: $addr,
+                    port: $port,
+                    method: $method,
+                    password: $password,
+                    uot: false
+                }]
+            },
+            streamSettings: { network: "tcp" }
+        }'
+}
+
 # parse_base64_subscription <raw> → emits a JSON array of outbounds
 parse_base64_subscription() {
     local raw="$1"
@@ -307,32 +396,40 @@ parse_base64_subscription() {
     [ -n "${decoded}" ] || die "failed to base64-decode subscription"
 
     local out='[]'
-    local line idx=0 tag name
+    local line idx=0 tag name prefix
     while IFS= read -r line; do
         line="$(printf '%s' "${line}" | tr -d '\r')"
         [ -z "${line}" ] && continue
+        # dispatch by URI scheme; tag prefix doubles as the balancer selector.
+        case "${line}" in
+            vless://*) prefix="vless" ;;
+            ss://*)    prefix="ss" ;;
+            *) idx=$(( idx + 1 )); log "skip line ${idx}: unsupported scheme"; continue ;;
+        esac
         # extract name from #fragment for human-readable tag
         name=""
         if [[ "${line}" == *\#* ]]; then
             name="$(urldecode "${line#*#}")"
         fi
         idx=$(( idx + 1 ))
-        tag="vless-$(printf '%s' "${name:-server-${idx}}" \
+        tag="${prefix}-$(printf '%s' "${name:-server-${idx}}" \
             | tr ' /:' '___' | tr -cd 'A-Za-z0-9._-' | cut -c1-48)"
         # ensure uniqueness if names collide
         tag="${tag}-${idx}"
 
         local outbound preview
         # Truncate URI for logging without leaking the UUID/key fully.
-        preview="$(printf '%s' "${line}" | cut -c1-12)…$(printf '%s' "${line}" | awk -F'?' '{print "?" substr($2,1,40)}')"
-        if outbound="$(parse_vless_uri "${line}" "${tag}")"; then
+        preview="$(printf '%s' "${line}" | cut -c1-12)…"
+        if [ "${prefix}" = "ss" ] && outbound="$(parse_ss_uri "${line}" "${tag}")"; then
+            out="$(printf '%s' "${out}" | jq --argjson o "${outbound}" '. + [$o]')"
+        elif [ "${prefix}" = "vless" ] && outbound="$(parse_vless_uri "${line}" "${tag}")"; then
             out="$(printf '%s' "${out}" | jq --argjson o "${outbound}" '. + [$o]')"
         else
             log "skip line ${idx}: ${preview}"
         fi
     done <<< "${decoded}"
 
-    [ "$(printf '%s' "${out}" | jq 'length')" -gt 0 ] || die "no vless outbounds parsed from base64 subscription"
+    [ "$(printf '%s' "${out}" | jq 'length')" -gt 0 ] || die "no usable outbounds parsed from base64 subscription"
     printf '%s' "${out}"
 }
 
@@ -346,14 +443,16 @@ parse_xray_json_subscription() {
         elif type == "array" then .
         else error("not an xray config")
         end
-        | map(select(.protocol == "vless"))
+        | map(select(.protocol == "vless" or .protocol == "shadowsocks"))
     ' 2>/dev/null)" && [ "$(printf '%s' "${outbounds}" | jq 'length')" -gt 0 ]; then
-        # ensure tags exist and are prefixed
+        # ensure tags exist and carry a protocol-appropriate selector prefix
         printf '%s' "${outbounds}" | jq -c '
             to_entries | map(
-                (.value.tag //= ("vless-server-" + ((.key+1)|tostring)))
-                | (if (.value.tag | startswith("vless-")) then .value
-                   else .value + {tag: ("vless-" + .value.tag)}
+                (if .value.protocol == "shadowsocks" then "ss-" else "vless-" end) as $pfx
+                | (.value.tag //= ($pfx + "server-" + ((.key+1)|tostring)))
+                | (if (.value.tag | startswith("vless-")) or (.value.tag | startswith("ss-"))
+                   then .value
+                   else .value + {tag: ($pfx + .value.tag)}
                    end)
             )
         '
@@ -367,9 +466,9 @@ parse_xray_json_subscription() {
 build_config() {
     local outbounds_json="$1"
 
-    # selector accepts tag prefixes; "vless-" matches every tag we emit in
-    # parse_vless_uri / parse_xray_json_subscription. observatory uses the same.
-    local selector_prefix='["vless-"]'
+    # selector accepts tag prefixes; "vless-"/"ss-" match every tag we emit in
+    # the URI / xray-json parsers. observatory uses the same set.
+    local selector_prefix='["vless-","ss-"]'
 
     local privacy_rules='[]'
     if [ "${BYPASS_PRIVATE}" = "1" ]; then
@@ -429,19 +528,27 @@ build_config() {
         '{
             log: { loglevel: $log_level },
             policy: {
-                # Bound per-connection memory and reap stuck/idle connections.
-                # Under full-tunnel xray holds a buffer + goroutines per LAN
-                # connection; without these caps memory grows unbounded as
-                # half-open/idle connections accumulate (see XTLS/Xray-core
-                # #4054, #4294). bufferSize caps per-direction RAM; connIdle
-                # closes silent connections so they stop pinning memory.
+                # Per-connection memory is the capacity limit on this router.
+                # Each request pins a bufferSize-KB buffer (counted per
+                # direction, plus TLS/REALITY state), so a ~6000-connection
+                # storm from a full-tunnel Telegram client (which cannot be
+                # bypassed since Telegram is blocked) costs roughly, measured:
+                #   bufferSize 4  -> ~100-150 MiB  (safe)
+                #   bufferSize 16 -> ~520 MiB      (hits memory-max, OOM)
+                #   bufferSize 64 -> OOM
+                # Throughput here is link-bound (~200 Mbit/s; 4 parallel streams
+                # are no faster than 1), so a bigger buffer buys no speed, only
+                # memory. So we use 4 (the xray arm64 default): full throughput
+                # and the whole storm fits well under the cap.
+                # connIdle/uplinkOnly/downlinkOnly still reap idle and
+                # half-open connections so they stop pinning memory.
                 levels: {
                     "0": {
                         handshake: 4,
                         connIdle: $conn_idle,
                         uplinkOnly: 2,
                         downlinkOnly: 4,
-                        bufferSize: 64
+                        bufferSize: 4
                     }
                 },
                 system: {
@@ -475,7 +582,14 @@ build_config() {
                     listen: "0.0.0.0",
                     port: $tproxy_port,
                     protocol: "dokodemo-door",
-                    settings: { network: "tcp", followRedirect: true },
+                    # userLevel ties this inbound to policy.levels."0" so connIdle
+                    # actually reaps its connections; sockopt enables TCP keepalive
+                    # (off by default on inbounds) so the kernel detects LAN clients
+                    # that vanished without a FIN and closes the dangling upstream
+                    # leg — together they cap the established-connection backlog
+                    # (REALITY dangling connections, XTLS/Xray-core #5247, #4586).
+                    settings: { network: "tcp", followRedirect: true, userLevel: 0 },
+                    streamSettings: { sockopt: { tcpKeepAliveIdle: 30, tcpKeepAliveInterval: 15 } },
                     sniffing: { enabled: true, destOverride: ["http","tls","quic"], routeOnly: false }
                 },
                 {
@@ -483,7 +597,8 @@ build_config() {
                     listen: "0.0.0.0",
                     port: $socks_port,
                     protocol: "socks",
-                    settings: { auth: "noauth", udp: true },
+                    settings: { auth: "noauth", udp: true, userLevel: 0 },
+                    streamSettings: { sockopt: { tcpKeepAliveIdle: 30, tcpKeepAliveInterval: 15 } },
                     sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
                 },
                 {
@@ -596,7 +711,7 @@ refresh_config_once() {
 
     if [ "${format}" = "xray-json" ]; then
         if ! outbounds="$(parse_xray_json_subscription "${raw}")"; then
-            log "xray-json had no vless outbounds, falling back to base64"
+            log "xray-json had no usable outbounds, falling back to base64"
             outbounds="$(parse_base64_subscription "${raw}")"
         fi
     else
@@ -605,7 +720,7 @@ refresh_config_once() {
 
     local count
     count="$(printf '%s' "${outbounds}" | jq 'length')"
-    log "parsed ${count} vless outbound(s)"
+    log "parsed ${count} proxy outbound(s)"
 
     build_config "${outbounds}" > "${CONFIG_NEW}"
     log "validating new config"
@@ -778,21 +893,82 @@ xray_rss_mb() {
     [ -n "${rss_kb}" ] && printf '%s' "$(( rss_kb / 1024 ))"
 }
 
-# memory_watchdog_loop: periodically reload xray once its RSS crosses the soft
-# threshold, reclaiming memory before the container hits its hard cgroup limit
-# and gets OOM-killed. Signals the parent (USR1) so reload runs in the main
-# context, like refresh_loop.
+# cgroup_mem_used_mb / cgroup_mem_limit_mb → the container's own memory cgroup
+# current usage and hard limit in MiB, or nothing if unreadable. This counts
+# what the kernel OOM-killer acts on (anonymous memory + kernel socket buffers
+# + mmap'd geodata), which VmRSS alone undercounts. Handles cgroup v2
+# (memory.current / memory.max) and v1 (memory.usage_in_bytes /
+# memory.limit_in_bytes).
+cgroup_mem_used_mb() {
+    local bytes=""
+    if [ -r "${CGROUP_ROOT}/memory.current" ]; then
+        bytes="$(cat "${CGROUP_ROOT}/memory.current" 2>/dev/null)"
+    elif [ -r "${CGROUP_ROOT}/memory/memory.usage_in_bytes" ]; then
+        bytes="$(cat "${CGROUP_ROOT}/memory/memory.usage_in_bytes" 2>/dev/null)"
+    fi
+    case "${bytes}" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$(( bytes / 1048576 ))"
+}
+
+cgroup_mem_limit_mb() {
+    local raw=""
+    if [ -r "${CGROUP_ROOT}/memory.max" ]; then
+        raw="$(cat "${CGROUP_ROOT}/memory.max" 2>/dev/null)"
+    elif [ -r "${CGROUP_ROOT}/memory/memory.limit_in_bytes" ]; then
+        raw="$(cat "${CGROUP_ROOT}/memory/memory.limit_in_bytes" 2>/dev/null)"
+    fi
+    # "max" (v2) means unlimited; so does the astronomically large v1 sentinel.
+    [ "${raw}" = "max" ] && return 0
+    case "${raw}" in ''|*[!0-9]*) return 0 ;; esac
+    [ "${raw}" -gt 1125899906842624 ] 2>/dev/null && return 0   # > 1 PiB ≈ unlimited
+    printf '%s' "$(( raw / 1048576 ))"
+}
+
+# memory_watchdog_loop: periodically reload xray before the container hits its
+# hard cgroup limit and gets OOM-killed, reclaiming the leaked memory. Two
+# independent triggers, whichever fires first:
+#   1. cgroup memory >= XRAY_CGROUP_RELOAD_PCT% of the cgroup limit — the figure
+#      the kernel OOM-killer actually acts on (catches mmap/socket memory that
+#      VmRSS misses). This is the primary guard.
+#   2. xray VmRSS >= XRAY_MEM_RELOAD_MB — a fallback that still catches a pure
+#      heap spike and works if the cgroup files are unreadable.
+# Signals the parent (USR1) so the reload runs in the main context, like
+# refresh_loop, then cools down so a slow post-reload drop is not re-triggered.
 memory_watchdog_loop() {
-    [ "${XRAY_MEM_RELOAD_MB}" -gt 0 ] 2>/dev/null || { log "memory-watchdog disabled"; return 0; }
-    log "memory-watchdog: reload xray when RSS >= ${XRAY_MEM_RELOAD_MB}MiB (every ${MEM_CHECK_INTERVAL_SECONDS}s)"
+    local rss_on=0 cg_on=0
+    [ "${XRAY_MEM_RELOAD_MB}" -gt 0 ] 2>/dev/null && rss_on=1
+    [ "${XRAY_CGROUP_RELOAD_PCT}" -gt 0 ] 2>/dev/null && cg_on=1
+    if [ "${rss_on}" -eq 0 ] && [ "${cg_on}" -eq 0 ]; then
+        log "memory-watchdog disabled"; return 0
+    fi
+    log "memory-watchdog: reload xray when cgroup mem >= ${XRAY_CGROUP_RELOAD_PCT}% of limit or RSS >= ${XRAY_MEM_RELOAD_MB}MiB (every ${MEM_CHECK_INTERVAL_SECONDS}s)"
     while sleep "${MEM_CHECK_INTERVAL_SECONDS}" & wait $!; do
         [ "${SHUTTING_DOWN}" = "1" ] && return 0
-        local rss
-        rss="$(xray_rss_mb)"
-        [ -n "${rss}" ] || continue
-        if [ "${rss}" -ge "${XRAY_MEM_RELOAD_MB}" ]; then
-            log "memory-watchdog: xray RSS ${rss}MiB >= ${XRAY_MEM_RELOAD_MB}MiB → reloading xray"
-            kill -USR1 "$$" 2>/dev/null || true
+        # Primary: cgroup memory vs the OOM-killer's own threshold.
+        if [ "${cg_on}" -eq 1 ]; then
+            local used limit thresh
+            used="$(cgroup_mem_used_mb)"
+            limit="$(cgroup_mem_limit_mb)"
+            if [ -n "${used}" ] && [ -n "${limit}" ] && [ "${limit}" -gt 0 ]; then
+                thresh="$(( limit * XRAY_CGROUP_RELOAD_PCT / 100 ))"
+                if [ "${used}" -ge "${thresh}" ]; then
+                    log "memory-watchdog: cgroup mem ${used}MiB >= ${thresh}MiB (${XRAY_CGROUP_RELOAD_PCT}% of ${limit}MiB) → reloading xray"
+                    kill -USR1 "$$" 2>/dev/null || true
+                    sleep "${MEM_RELOAD_COOLDOWN_SECONDS}" & wait $!
+                    continue
+                fi
+            fi
+        fi
+        # Fallback: xray heap spike.
+        if [ "${rss_on}" -eq 1 ]; then
+            local rss
+            rss="$(xray_rss_mb)"
+            [ -n "${rss}" ] || continue
+            if [ "${rss}" -ge "${XRAY_MEM_RELOAD_MB}" ]; then
+                log "memory-watchdog: xray RSS ${rss}MiB >= ${XRAY_MEM_RELOAD_MB}MiB → reloading xray"
+                kill -USR1 "$$" 2>/dev/null || true
+                sleep "${MEM_RELOAD_COOLDOWN_SECONDS}" & wait $!
+            fi
         fi
     done
 }
