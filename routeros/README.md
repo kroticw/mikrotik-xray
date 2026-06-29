@@ -20,39 +20,46 @@ The RU set lives in the `RU` IPv4 firewall address-list, built from
 [ipdeny](https://www.ipdeny.com/) `ru-aggregated`. IPv6 is not proxied through
 the container, so no v6 list is needed.
 
-### Keeping the list fresh — two paths
+### How the list stays fresh
 
-**Automatic (on-router).** `03-geo-split.rsc` installs a script + daily
-scheduler that re-fetch the list. This needs RouterOS **device-mode** to allow
-both features:
+RouterOS cannot parse a large raw CIDR list in-script (both `/file/get
+contents` and `fetch ... as-value` cap at ~63 KB), so the list is built
+**off-box** and the router only fetches a ready-made `.rsc`:
+
+1. A GitHub Action (`.github/workflows/update-ru-list.yml`) regenerates
+   `routeros/ru-geo.rsc` from ipdeny weekly and commits it when it changes.
+2. On the router, `03-geo-split.rsc` installs a script + daily scheduler that
+   `fetch` the committed `ru-geo.rsc` from GitHub raw and `/import` it (no size
+   limit on `/import`).
+
+This needs RouterOS **device-mode** to allow `fetch` and `scheduler`:
 
 ```text
-/system/device-mode/print          ;# check: fetch and scheduler must be "yes"
+/system/device-mode/print          ;# fetch and scheduler must be "yes"
 /system/device-mode/update fetch=yes scheduler=yes
 ```
 
 `device-mode/update` requires **physical confirmation** (press the reset/mode
 button or power-cycle within the timeout) — it cannot be done purely remotely.
-After enabling, import `03-geo-split.rsc` and run the job once:
+Specify only the per-feature flags (no `mode=`), or the other features reset.
+After enabling, import the setup and run the job once:
 
 ```text
 /import file-name=03-geo-split.rsc
 /system script run ru-geo-update
 ```
 
-**Manual (host-side).** While `fetch` is disabled in device-mode, generate the
-list on a workstation and import it. `03-geo-split.rsc` still provides the
-mangle rule; only the auto-refresh is dormant.
+**Manual fallback (no device-mode / no CI).** Generate the list on a
+workstation and import it directly; `03-geo-split.rsc` still provides the
+mangle rule.
 
 ```bash
 ./scripts/gen-ru-list.sh ru-geo.rsc
 scp ru-geo.rsc admin@<router>:ru-geo.rsc
-# on RouterOS:
-#   /import file-name=ru-geo.rsc
+# on RouterOS:  /import file-name=ru-geo.rsc
 ```
 
-RU allocations change slowly, so a periodic manual refresh is acceptable until
-device-mode auto-update is enabled.
+RU allocations change slowly, so even an occasional refresh is fine.
 
 ### Reverting
 

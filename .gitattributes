@@ -5,5 +5,8 @@ dist/**            binary linguist-generated
 # RouterOS scripts — show as plain text on GitHub
 *.rsc              text linguist-language=Tcl
 
+# generated RU address-list — refreshed by CI, collapse in diffs/stats
+routeros/ru-geo.rsc linguist-generated
+
 # Bash scripts
 *.sh               text eol=lf

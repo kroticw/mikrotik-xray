@@ -28,37 +28,26 @@
 /system script
 :if ([:len [find where name="ru-geo-update"]] = 0) do={
     add name=ru-geo-update policy=read,write,test source={
-        :local url "https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
+        # Fetch the pre-built address-list .rsc and import it. RouterOS cannot
+        # read a large raw list into a script variable (both /file/get contents
+        # and fetch as-value cap at ~63 KB), so the list is built off-box: a CI
+        # job regenerates ru-geo.rsc from ipdeny and commits it, and we just
+        # fetch + import the file (no size limit on /import). check-certificate=no
+        # because the device has no CA store; the file only steers routing.
+        :local url "https://raw.githubusercontent.com/kroticw/mikrotik-xray/master/routeros/ru-geo.rsc"
         :do {
-            /tool/fetch url=$url mode=https check-certificate=no dst-path="ru-aggregated.zone"
+            /tool/fetch url=$url mode=https check-certificate=no dst-path="ru-geo.rsc"
         } on-error={
             :log warning "ru-geo-update: fetch failed, keeping existing RU list"
             :error "fetch failed"
         }
-        :delay 2s
-        :local data [/file/get [/file/find name="ru-aggregated.zone"] contents]
-        :if ([:len $data] < 100) do={
-            :log warning "ru-geo-update: empty download, keeping existing RU list"
-            :error "empty download"
+        :delay 1s
+        :if ([:len [/file/find name="ru-geo.rsc"]] = 0) do={
+            :log warning "ru-geo-update: ru-geo.rsc missing after fetch"
+            :error "no file"
         }
-        /ip firewall address-list remove [find list=RU]
-        :local pos 0
-        :local len [:len $data]
-        :while ($pos < $len) do={
-            :local nl [:find $data "\n" $pos]
-            :local line
-            :if ([:typeof $nl] = "nil") do={
-                :set line [:pick $data $pos $len]
-                :set pos $len
-            } else={
-                :set line [:pick $data $pos $nl]
-                :set pos ($nl + 1)
-            }
-            :if ([:len $line] > 6) do={
-                :do { /ip firewall address-list add list=RU address=$line } on-error={}
-            }
-        }
-        :log info ("ru-geo-update: RU list rebuilt, entries=" . \
+        /import file-name="ru-geo.rsc"
+        :log info ("ru-geo-update: RU list imported, entries=" . \
             [:len [/ip firewall address-list find where list=RU]])
     }
 }
