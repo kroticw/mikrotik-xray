@@ -447,9 +447,16 @@ build_config() {
                 }
             },
             dns: {
+                # Internal resolver for xray routing only: domainStrategy
+                # IPIfNonMatch resolves sniffed domains to IPs for the geoip
+                # rules. Plain public resolvers, dropping the former
+                # geosite:geolocation-!cn selector that loaded the large non-CN
+                # domain set into memory for no benefit here. Client DNS is
+                # handled separately by RouterOS/AdGuard, so this serves only
+                # the internal resolution and stays clean of the ISP resolver.
                 servers: [
-                    { address: "1.1.1.1", domains: ["geosite:geolocation-!cn"] },
-                    { address: "8.8.8.8", skipFallback: true },
+                    "1.1.1.1",
+                    "8.8.8.8",
                     "localhost"
                 ]
             },
