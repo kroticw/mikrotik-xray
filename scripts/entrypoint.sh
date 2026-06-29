@@ -29,6 +29,11 @@ IFS=$'\n\t'
 # instead. Defaults give ~5 min of grace (30 * 10s).
 : "${INITIAL_FETCH_RETRIES:=30}"
 : "${INITIAL_FETCH_RETRY_DELAY:=10}"
+# Open-file limit for xray. A busy proxy holds 2+ descriptors per connection, so
+# the default soft cap (often 1024) is exhausted under load: xray stops
+# accepting connections and the healthcheck fails while memory stays fine. Lift
+# soft (and, when privileged, hard) to this value at startup.
+: "${XRAY_NOFILE:=1048576}"
 : "${TPROXY_PORT:=12345}"
 : "${SOCKS_PORT:=10808}"
 : "${DNS_PORT:=10853}"
@@ -698,6 +703,22 @@ setup_inbound_tproxy() {
 
 # ---------- xray process management ------------------------------------------
 
+# raise_nofile: lift the open-file limit so a busy xray does not run out of
+# descriptors under load. Tries to raise the hard cap first (needs privilege;
+# ignored when denied), then raises the soft limit as high as the hard cap
+# allows. Always logs the effective values so the limit is visible in the
+# container log — the one reliable way to read it from outside.
+raise_nofile() {
+    local target="${XRAY_NOFILE}"
+    [ -n "${target}" ] || target="$(ulimit -Hn 2>/dev/null)"
+    if [ -n "${target}" ] && [ "${target}" != "unlimited" ]; then
+        ulimit -Hn "${target}" 2>/dev/null || true
+        ulimit -Sn "${target}" 2>/dev/null \
+            || ulimit -Sn "$(ulimit -Hn 2>/dev/null)" 2>/dev/null || true
+    fi
+    log "open-file limit (nofile): soft=$(ulimit -Sn 2>/dev/null) hard=$(ulimit -Hn 2>/dev/null)"
+}
+
 start_xray() {
     log "starting xray (config=${CONFIG_FILE})"
     xray run -config "${CONFIG_FILE}" &
@@ -802,6 +823,8 @@ trap reload_xray USR1
 
 main() {
     mkdir --parents "${XRAY_CONFIG_DIR}" "${XRAY_STATE_DIR}"
+
+    raise_nofile
 
     setup_inbound
 
