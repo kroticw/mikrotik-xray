@@ -445,19 +445,27 @@ build_config() {
         '{
             log: { loglevel: $log_level },
             policy: {
-                # Bound per-connection memory and reap stuck/idle connections.
-                # Under full-tunnel xray holds a buffer + goroutines per LAN
-                # connection; without these caps memory grows unbounded as
-                # half-open/idle connections accumulate (see XTLS/Xray-core
-                # #4054, #4294). bufferSize caps per-direction RAM; connIdle
-                # closes silent connections so they stop pinning memory.
+                # Per-connection memory is the capacity limit on this router.
+                # Each request pins a bufferSize-KB buffer (counted per
+                # direction, plus TLS/REALITY state), so a ~6000-connection
+                # storm from a full-tunnel Telegram client (which cannot be
+                # bypassed since Telegram is blocked) costs roughly, measured:
+                #   bufferSize 4  -> ~100-150 MiB  (safe)
+                #   bufferSize 16 -> ~520 MiB      (hits memory-max, OOM)
+                #   bufferSize 64 -> OOM
+                # Throughput here is link-bound (~200 Mbit/s; 4 parallel streams
+                # are no faster than 1), so a bigger buffer buys no speed, only
+                # memory. So we use 4 (the xray arm64 default): full throughput
+                # and the whole storm fits well under the cap.
+                # connIdle/uplinkOnly/downlinkOnly still reap idle and
+                # half-open connections so they stop pinning memory.
                 levels: {
                     "0": {
                         handshake: 4,
                         connIdle: $conn_idle,
                         uplinkOnly: 2,
                         downlinkOnly: 4,
-                        bufferSize: 64
+                        bufferSize: 4
                     }
                 },
                 system: {
