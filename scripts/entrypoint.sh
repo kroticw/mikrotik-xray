@@ -96,6 +96,17 @@ IFS=$'\n\t'
 # After a reload, wait this long before resuming memory checks so freed memory
 # settles and a slow drop does not trigger a second back-to-back reload.
 : "${MEM_RELOAD_COOLDOWN_SECONDS:=30}"
+# Liveness watchdog. The memory watchdog only catches OOM-shaped failures; xray
+# can also stop relaying traffic while its memory stays fine (a stalled
+# balancer/observatory, a dead upstream the observatory never re-probes back).
+# RouterOS does not restart a container on an unhealthy healthcheck — only on
+# process exit — so such a stall hangs the container in `unhealthy` until a
+# manual restart. So probe xray end-to-end through its own SOCKS inbound and
+# reload it after this many consecutive failures. 0 disables the liveness check.
+: "${XRAY_HEALTH_RELOAD_FAILS:=3}"
+: "${HEALTH_CHECK_INTERVAL_SECONDS:=30}"
+: "${HEALTH_PROBE_TIMEOUT:=8}"
+: "${XRAY_HEALTH_PROBE_URL:=http://www.gstatic.com/generate_204}"
 
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 CONFIG_NEW="${XRAY_CONFIG_DIR}/config.json.new"
@@ -107,6 +118,7 @@ GEODATA_LAST_RUN=0
 XRAY_PID=0
 REFRESH_PID=0
 WATCHDOG_PID=0
+HEALTH_PID=0
 SHUTTING_DOWN=0
 
 # ---------- logging -----------------------------------------------------------
@@ -973,6 +985,59 @@ memory_watchdog_loop() {
     done
 }
 
+# health_probe → 0 if xray relays an end-to-end request through its own SOCKS
+# inbound, non-zero otherwise. Mirrors the image HEALTHCHECK so the watchdog and
+# RouterOS agree on what "serving" means.
+health_probe() {
+    curl --silent --fail --max-time "${HEALTH_PROBE_TIMEOUT}" \
+        --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+        --output /dev/null "${XRAY_HEALTH_PROBE_URL}"
+}
+
+# health_eval <prev_fails> <probe_rc> <threshold> → echoes "<new_fails> <reload>"
+# Pure helper (no I/O) so the consecutive-failure logic is unit-testable: a
+# success resets the streak; a failure increments it; reaching the threshold
+# (when > 0) asks for a reload.
+health_eval() {
+    local prev="$1" rc="$2" thr="$3" n
+    if [ "${rc}" -eq 0 ]; then
+        printf '0 0'; return
+    fi
+    n=$(( prev + 1 ))
+    if [ "${thr}" -gt 0 ] && [ "${n}" -ge "${thr}" ]; then
+        printf '%s 1' "${n}"
+    else
+        printf '%s 0' "${n}"
+    fi
+}
+
+# health_watchdog_loop: reload xray when it stops relaying traffic while memory
+# is still fine — a serving stall the memory watchdog cannot see and that
+# RouterOS will not auto-restart (the process is alive, only unhealthy). Signals
+# the parent (USR1) like the other loops so the reload runs in the main context,
+# then cools down.
+health_watchdog_loop() {
+    if ! [ "${XRAY_HEALTH_RELOAD_FAILS}" -gt 0 ] 2>/dev/null; then
+        log "health-watchdog disabled"; return 0
+    fi
+    log "health-watchdog: reload xray after ${XRAY_HEALTH_RELOAD_FAILS} consecutive probe failures (every ${HEALTH_CHECK_INTERVAL_SECONDS}s)"
+    local fails=0 rc res reload
+    while sleep "${HEALTH_CHECK_INTERVAL_SECONDS}" & wait $!; do
+        [ "${SHUTTING_DOWN}" = "1" ] && return 0
+        # only probe once xray is actually running; a reload in progress resets.
+        pidof xray >/dev/null 2>&1 || { fails=0; continue; }
+        rc=0; health_probe || rc=$?
+        res="$(health_eval "${fails}" "${rc}" "${XRAY_HEALTH_RELOAD_FAILS}")"
+        fails="${res%% *}"; reload="${res##* }"
+        if [ "${reload}" = "1" ]; then
+            log "health-watchdog: ${fails} consecutive probe failures → reloading xray"
+            kill -USR1 "$$" 2>/dev/null || true
+            fails=0
+            sleep "${MEM_RELOAD_COOLDOWN_SECONDS}" & wait $!
+        fi
+    done
+}
+
 # ---------- signal handling --------------------------------------------------
 
 shutdown() {
@@ -981,6 +1046,7 @@ shutdown() {
     log "shutting down"
     [ "${REFRESH_PID}" -gt 0 ] && kill -TERM "${REFRESH_PID}" 2>/dev/null || true
     [ "${WATCHDOG_PID}" -gt 0 ] && kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
+    [ "${HEALTH_PID}" -gt 0 ] && kill -TERM "${HEALTH_PID}" 2>/dev/null || true
     stop_xray
     exit 0
 }
@@ -1031,6 +1097,9 @@ main() {
 
     memory_watchdog_loop &
     WATCHDOG_PID=$!
+
+    health_watchdog_loop &
+    HEALTH_PID=$!
 
     # block until xray exits or a signal forces shutdown.
     # Loop because USR1 trap re-spawns xray and we must wait on the new pid.

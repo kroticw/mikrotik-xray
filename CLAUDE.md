@@ -113,6 +113,17 @@ Relevant knobs:
 - `XRAY_MEM_RELOAD_MB` / `MEM_CHECK_INTERVAL_SECONDS` — RSS fallback: reload
   xray when VmRSS crosses the threshold; a short interval is what catches load
   spikes before the OOM kill.
+- `XRAY_HEALTH_RELOAD_FAILS` (default 3) / `HEALTH_CHECK_INTERVAL_SECONDS` —
+  **liveness** watchdog, a separate axis from memory. The memory watchdog only
+  catches OOM-shaped failures; xray can also stop relaying while memory stays
+  fine (stalled balancer/observatory, a dead upstream the observatory never
+  re-probes back). RouterOS does **not** restart a container on an unhealthy
+  healthcheck — only on process *exit* — so such a stall hangs it in
+  `unhealthy` until a manual restart. The watchdog probes xray end-to-end
+  through its own SOCKS inbound and reloads it after this many consecutive
+  failures (0 disables). `XRAY_HEALTH_PROBE_URL` / `HEALTH_PROBE_TIMEOUT` tune
+  the probe. Fewer outbounds (e.g. an SS-only squad with 2 nodes) makes the
+  stall more likely, since losing both upstreams leaves nothing to balance to.
 - `GOMEMLIMIT`, `GOGC` — Go GC pressure (soft heap target; does not cap
   goroutine stacks, so it cannot prevent OOM on its own).
 - `POLICY_CONN_IDLE` (default 30s) — idle-connection reap window; shorter
