@@ -4534,6 +4534,7 @@ add list=RU address=152.89.216.0/22
 add list=RU address=153.51.32.0/19
 add list=RU address=153.51.96.0/19
 add list=RU address=153.76.160.0/20
+add list=RU address=153.76.178.0/23
 add list=RU address=153.80.172.0/22
 add list=RU address=153.80.176.0/20
 add list=RU address=153.80.224.0/19
@@ -5066,7 +5067,6 @@ add list=RU address=185.1.76.0/24
 add list=RU address=185.1.81.0/24
 add list=RU address=185.1.117.0/24
 add list=RU address=185.1.118.0/24
-add list=RU address=185.1.152.0/23
 add list=RU address=185.1.162.0/24
 add list=RU address=185.1.165.0/24
 add list=RU address=185.2.72.0/22
