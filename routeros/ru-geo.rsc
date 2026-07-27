@@ -5896,6 +5896,7 @@ add list=RU address=185.149.48.0/22
 add list=RU address=185.149.64.0/22
 add list=RU address=185.149.96.0/22
 add list=RU address=185.149.124.0/22
+add list=RU address=185.149.144.0/22
 add list=RU address=185.149.160.0/22
 add list=RU address=185.149.194.0/24
 add list=RU address=185.149.196.0/22
