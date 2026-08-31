@@ -6853,7 +6853,6 @@ add list=RU address=193.93.244.0/22
 add list=RU address=193.104.11.0/24
 add list=RU address=193.104.14.0/24
 add list=RU address=193.104.24.0/24
-add list=RU address=193.104.27.0/24
 add list=RU address=193.104.28.0/24
 add list=RU address=193.104.59.0/24
 add list=RU address=193.104.64.0/24
@@ -7885,6 +7884,7 @@ add list=RU address=195.95.133.0/24
 add list=RU address=195.95.212.0/22
 add list=RU address=195.95.218.0/24
 add list=RU address=195.95.252.0/23
+add list=RU address=195.96.40.0/21
 add list=RU address=195.96.64.0/19
 add list=RU address=195.96.160.0/19
 add list=RU address=195.98.32.0/19
