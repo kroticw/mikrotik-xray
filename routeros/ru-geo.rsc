@@ -2439,7 +2439,6 @@ add list=RU address=91.198.75.0/24
 add list=RU address=91.198.85.0/24
 add list=RU address=91.198.98.0/24
 add list=RU address=91.198.104.0/24
-add list=RU address=91.198.127.0/24
 add list=RU address=91.198.130.0/24
 add list=RU address=91.198.149.0/24
 add list=RU address=91.198.153.0/24
@@ -2488,7 +2487,7 @@ add list=RU address=91.200.44.0/22
 add list=RU address=91.200.62.0/24
 add list=RU address=91.200.84.0/22
 add list=RU address=91.200.148.0/22
-add list=RU address=91.200.160.0/21
+add list=RU address=91.200.160.0/22
 add list=RU address=91.200.224.0/21
 add list=RU address=91.201.0.0/22
 add list=RU address=91.201.8.0/23
@@ -2834,7 +2833,6 @@ add list=RU address=91.215.224.0/22
 add list=RU address=91.215.232.0/22
 add list=RU address=91.215.244.0/22
 add list=RU address=91.215.248.0/21
-add list=RU address=91.216.3.0/24
 add list=RU address=91.216.46.0/24
 add list=RU address=91.216.48.0/23
 add list=RU address=91.216.50.0/24
@@ -4598,6 +4596,7 @@ add list=RU address=159.253.120.0/24
 add list=RU address=159.253.168.0/21
 add list=RU address=159.255.0.0/19
 add list=RU address=159.255.64.0/18
+add list=RU address=160.5.208.0/20
 add list=RU address=160.20.156.0/22
 add list=RU address=161.104.16.0/20
 add list=RU address=161.104.32.0/19
@@ -4610,8 +4609,7 @@ add list=RU address=164.138.100.0/22
 add list=RU address=164.177.176.0/21
 add list=RU address=164.215.48.0/21
 add list=RU address=164.215.64.0/19
-add list=RU address=168.113.144.0/20
-add list=RU address=168.113.160.0/19
+add list=RU address=168.113.128.0/18
 add list=RU address=168.113.192.0/20
 add list=RU address=168.113.208.0/21
 add list=RU address=168.113.232.0/21
@@ -5411,7 +5409,6 @@ add list=RU address=185.46.8.0/21
 add list=RU address=185.46.16.0/22
 add list=RU address=185.46.44.0/22
 add list=RU address=185.46.48.0/22
-add list=RU address=185.46.84.0/22
 add list=RU address=185.46.96.0/22
 add list=RU address=185.46.152.0/22
 add list=RU address=185.46.196.0/22
@@ -7741,7 +7738,7 @@ add list=RU address=195.43.68.0/23
 add list=RU address=195.43.76.0/23
 add list=RU address=195.43.90.0/23
 add list=RU address=195.43.92.0/22
-add list=RU address=195.43.135.0/24
+add list=RU address=195.43.134.0/23
 add list=RU address=195.43.144.0/24
 add list=RU address=195.46.96.0/19
 add list=RU address=195.46.160.0/19
