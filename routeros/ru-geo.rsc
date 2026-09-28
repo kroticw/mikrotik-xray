@@ -3918,8 +3918,7 @@ add list=RU address=94.140.128.0/19
 add list=RU address=94.140.192.0/18
 add list=RU address=94.141.32.0/19
 add list=RU address=94.141.104.0/21
-add list=RU address=94.141.112.0/21
-add list=RU address=94.141.124.0/22
+add list=RU address=94.141.112.0/20
 add list=RU address=94.141.160.0/19
 add list=RU address=94.141.244.0/22
 add list=RU address=94.141.252.0/22
@@ -4575,7 +4574,7 @@ add list=RU address=157.22.248.0/22
 add list=RU address=157.22.252.0/23
 add list=RU address=157.22.254.0/24
 add list=RU address=157.186.0.0/16
-add list=RU address=157.228.96.0/24
+add list=RU address=157.228.96.0/23
 add list=RU address=158.46.0.0/16
 add list=RU address=158.58.128.0/21
 add list=RU address=158.160.0.0/16
@@ -4587,6 +4586,7 @@ add list=RU address=158.255.75.0/24
 add list=RU address=158.255.80.0/21
 add list=RU address=158.255.128.0/18
 add list=RU address=159.93.0.0/16
+add list=RU address=159.194.192.0/24
 add list=RU address=159.194.196.0/22
 add list=RU address=159.194.200.0/21
 add list=RU address=159.194.208.0/20
@@ -5386,6 +5386,7 @@ add list=RU address=185.42.108.0/22
 add list=RU address=185.42.124.0/22
 add list=RU address=185.42.144.0/22
 add list=RU address=185.42.156.0/22
+add list=RU address=185.42.163.0/24
 add list=RU address=185.42.164.0/22
 add list=RU address=185.42.180.0/22
 add list=RU address=185.42.228.0/22
