@@ -8288,6 +8288,8 @@ add list=RU address=212.192.192.0/20
 add list=RU address=212.192.224.0/20
 add list=RU address=212.192.246.0/23
 add list=RU address=212.192.248.0/23
+add list=RU address=212.193.10.0/23
+add list=RU address=212.193.14.0/23
 add list=RU address=212.193.32.0/19
 add list=RU address=212.193.64.0/18
 add list=RU address=212.193.128.0/17
